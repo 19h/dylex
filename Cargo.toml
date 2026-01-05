@@ -1,0 +1,79 @@
+[package]
+name = "dylex"
+version = "0.1.0"
+edition = "2021"
+authors = ["dylex contributors"]
+description = "A high-performance dyld shared cache extractor for macOS and iOS"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/anomalyco/dylex"
+homepage = "https://github.com/anomalyco/dylex"
+documentation = "https://docs.rs/dylex"
+keywords = ["dyld", "macho", "ios", "macos", "reverse-engineering"]
+categories = ["command-line-utilities", "development-tools", "parsing"]
+rust-version = "1.75"
+exclude = [
+    "DyldExtractor/**",
+    "dyld-shared-cache-extractor/**",
+    ".github/**",
+    ".DS_Store",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+# Binary parsing
+zerocopy = { version = "0.8", features = ["derive"] }
+scroll = { version = "0.12", features = ["derive"] }
+
+# Memory mapping
+memmap2 = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging and progress
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+indicatif = "0.17"
+
+# Parallelism
+rayon = "1.10"
+
+# Utils
+byteorder = "1"
+bitflags = "2"
+indexmap = "2"
+rustc-hash = "2"
+
+[dev-dependencies]
+tempfile = "3"
+pretty_assertions = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1  # Some optimization for faster dev builds
+
+[[bin]]
+name = "dylex"
+path = "src/main.rs"
+
+[lib]
+name = "dylex"
+path = "src/lib.rs"
+
+[features]
+default = []

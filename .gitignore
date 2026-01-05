@@ -1,0 +1,27 @@
+# Build artifacts
+/target
+debug/
+release/
+
+# Cargo (note: Cargo.lock is committed for binaries)
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+._*
+
+# Test outputs
+/extracted/
+*.dylib
+*.a
+
+# Reference implementations (not part of dylex)
+/DyldExtractor/
+/dyld-shared-cache-extractor/
