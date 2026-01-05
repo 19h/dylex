@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/dylex.svg)](https://crates.io/crates/dylex)
 [![Documentation](https://docs.rs/dylex/badge.svg)](https://docs.rs/dylex)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
 
 A high-performance dyld shared cache extractor for macOS and iOS, written in Rust.
 
