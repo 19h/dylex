@@ -66,7 +66,11 @@ impl SectionInfo {
 // =============================================================================
 
 /// Parsed load command information.
+///
+/// Represents the various types of load commands found in a Mach-O file.
+/// The variant names correspond to the load command types.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)] // Variants are self-documenting via names
 pub enum LoadCommandInfo {
     Segment(SegmentInfo),
     Symtab {

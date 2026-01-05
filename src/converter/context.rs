@@ -132,12 +132,16 @@ pub struct WriteProcedure {
 
 /// Source of data for a write procedure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // Fields within variants are implementation details
 pub enum WriteSource {
-    /// Data from the dyld cache
-    Cache { subcache_index: usize },
-    /// Data from the Mach-O being built
+    /// Data from the dyld cache at the specified subcache index.
+    Cache {
+        /// Index into the subcache array (0 = main cache).
+        subcache_index: usize,
+    },
+    /// Data from the Mach-O being built.
     Macho,
-    /// Data from the extra segment
+    /// Data from the extra segment.
     ExtraSegment,
 }
 

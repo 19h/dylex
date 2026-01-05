@@ -23,12 +23,11 @@ pub fn optimize_offsets(ctx: &mut ExtractionContext) -> Result<Vec<WriteProcedur
     ctx.info("Optimizing file offsets...");
 
     let mut procedures = Vec::new();
-    let mut write_offset = 0u64;
 
     // Write header and load commands from the MachOContext (which may have been modified)
     let header_size = ctx.macho.header.sizeofcmds as u64 + 32; // Header + load commands
     procedures.push(WriteProcedure::from_macho(0, 0, header_size));
-    write_offset = align_to(header_size, PAGE_SIZE);
+    let mut write_offset = align_to(header_size, PAGE_SIZE);
 
     // Collect segment info first (to avoid borrow issues)
     // Also track the old and new LINKEDIT offset
@@ -100,8 +99,7 @@ pub fn optimize_offsets(ctx: &mut ExtractionContext) -> Result<Vec<WriteProcedur
             0,
             ctx.extra_segment_size() as u64,
         ));
-        write_offset += ctx.extra_segment_size() as u64;
-        write_offset = align_to(write_offset, PAGE_SIZE);
+        // Note: write_offset not updated here as it's the final segment
     }
 
     // Update LINKEDIT-related load commands if LINKEDIT moved

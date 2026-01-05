@@ -344,8 +344,13 @@ impl<'a> ExportTrieParser<'a> {
 // Bind Opcode Parser
 // =============================================================================
 
-/// Bind opcodes.
+/// Bind opcodes used in the dyld bind info.
+///
+/// These constants define the opcodes used in the compressed binding
+/// information format found in LC_DYLD_INFO load commands.
+#[allow(missing_docs)] // Constants are self-documenting via names
 pub mod bind_opcodes {
+    /// Terminates a binding sequence.
     pub const BIND_OPCODE_DONE: u8 = 0x00;
     pub const BIND_OPCODE_SET_DYLIB_ORDINAL_IMM: u8 = 0x10;
     pub const BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB: u8 = 0x20;
@@ -383,7 +388,12 @@ pub struct BindRecord {
 }
 
 /// Parses bind info opcodes.
-pub fn parse_bind_info(data: &[u8], segment_addresses: &[u64]) -> Result<Vec<BindRecord>> {
+///
+/// # Arguments
+///
+/// * `data` - The raw bind info data
+/// * `_segment_addresses` - Segment base addresses (reserved for future use)
+pub fn parse_bind_info(data: &[u8], _segment_addresses: &[u64]) -> Result<Vec<BindRecord>> {
     use bind_opcodes::*;
 
     let mut records = Vec::new();

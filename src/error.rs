@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 /// The main error type for dyld cache extraction operations.
+///
+/// Each variant includes a descriptive error message via `thiserror`.
 #[derive(Error, Debug)]
+#[allow(missing_docs)] // Error messages serve as documentation
 pub enum Error {
     // ==================== I/O Errors ====================
     #[error("I/O error: {0}")]
