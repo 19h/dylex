@@ -50,8 +50,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use converter::{
-    fix_objc, fix_stubs, optimize_linkedit, optimize_offsets, process_slide_info, write_macho,
-    ExtractionContext,
+    ExtractionContext, fix_objc, fix_stubs, optimize_linkedit, optimize_offsets,
+    process_slide_info, write_macho,
 };
 
 /// Extracts a single image from the cache.

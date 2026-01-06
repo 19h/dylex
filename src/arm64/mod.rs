@@ -117,11 +117,7 @@ pub fn decode_adrp(instr: u32, pc: u64) -> u64 {
 pub fn decode_add_imm(instr: u32) -> u32 {
     let imm12 = (instr >> 10) & 0xFFF;
     let shift = (instr >> 22) & 0x3;
-    if shift == 1 {
-        imm12 << 12
-    } else {
-        imm12
-    }
+    if shift == 1 { imm12 << 12 } else { imm12 }
 }
 
 /// Decodes an LDR (unsigned immediate) instruction, returning the offset.

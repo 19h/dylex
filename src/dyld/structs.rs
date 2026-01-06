@@ -357,7 +357,7 @@ pub struct DyldCacheImageTextInfo {
 // Slide Info Structures
 // =============================================================================
 
-/// Slide info version 2 (standard arm64).
+/// Slide info version 2 (standard arm64 and x86_64).
 #[derive(Debug, Clone, Copy, FromBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct DyldCacheSlideInfo2 {
@@ -365,9 +365,11 @@ pub struct DyldCacheSlideInfo2 {
     pub version: u32,
     /// Page size (typically 4KB)
     pub page_size: u32,
+    /// Offset to page starts array (from start of this struct)
+    pub page_starts_offset: u32,
     /// Number of page starts entries
     pub page_starts_count: u32,
-    /// Offset to page extras
+    /// Offset to page extras array (from start of this struct)
     pub page_extras_offset: u32,
     /// Number of page extras entries
     pub page_extras_count: u32,
@@ -375,8 +377,6 @@ pub struct DyldCacheSlideInfo2 {
     pub delta_mask: u64,
     /// Value to add to rebased pointers
     pub value_add: u64,
-    /// Offset to page starts array
-    pub page_starts_offset: u32,
 }
 
 impl DyldCacheSlideInfo2 {
@@ -588,10 +588,21 @@ impl fmt::Display for DyldCacheHeader {
 pub fn uuid_to_string(uuid: &[u8; 16]) -> String {
     format!(
         "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        uuid[0], uuid[1], uuid[2], uuid[3],
-        uuid[4], uuid[5],
-        uuid[6], uuid[7],
-        uuid[8], uuid[9],
-        uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
+        uuid[0],
+        uuid[1],
+        uuid[2],
+        uuid[3],
+        uuid[4],
+        uuid[5],
+        uuid[6],
+        uuid[7],
+        uuid[8],
+        uuid[9],
+        uuid[10],
+        uuid[11],
+        uuid[12],
+        uuid[13],
+        uuid[14],
+        uuid[15]
     )
 }

@@ -12,9 +12,9 @@ use crate::dyld::{
 };
 use crate::error::{Error, Result};
 use crate::macho::{
-    DyldInfoCommand, DysymtabCommand, LinkeditDataCommand, LoadCommandInfo, Nlist64, SymtabCommand,
-    INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_DATA_IN_CODE, LC_DYLD_EXPORTS_TRIE,
-    LC_FUNCTION_STARTS,
+    DyldInfoCommand, DysymtabCommand, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_DATA_IN_CODE,
+    LC_DYLD_EXPORTS_TRIE, LC_FUNCTION_STARTS, LinkeditDataCommand, LoadCommandInfo, Nlist64,
+    SymtabCommand,
 };
 
 use super::ExtractionContext;

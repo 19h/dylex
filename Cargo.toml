@@ -1,6 +1,6 @@
 [package]
 name = "dylex"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["dylex contributors"]
 description = "A high-performance dyld shared cache extractor for macOS and iOS"

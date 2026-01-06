@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use tracing::{error, info, warn, Level};
+use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use dylex::{extract_image_with_options, DyldContext, ExtractionOptions};
+use dylex::{DyldContext, ExtractionOptions, extract_image_with_options};
 
 /// Default locations to search for dyld shared caches on macOS.
 const DEFAULT_CACHE_PATHS: &[&str] = &[
