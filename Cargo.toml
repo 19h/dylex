@@ -1,6 +1,6 @@
 [package]
 name = "dylex"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["dylex contributors"]
 description = "A high-performance dyld shared cache extractor for macOS and iOS"
@@ -59,13 +59,28 @@ tempfile = "3"
 pretty_assertions = "1"
 
 [profile.release]
-lto = true
+lto = "fat"                    # Full cross-crate LTO for maximum optimization
+codegen-units = 1              # Single codegen unit for better optimization
+panic = "abort"                # Smaller binary, no unwinding overhead
+strip = true                   # Strip symbols
+opt-level = 3                  # Maximum optimization level
+overflow-checks = false        # Disable overflow checks in release
+debug-assertions = false       # Disable debug assertions
+
+[profile.release-fast]
+inherits = "release"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+opt-level = 3
 
 [profile.dev]
 opt-level = 1  # Some optimization for faster dev builds
+
+# Build dependencies with optimizations even in dev mode
+[profile.dev.package."*"]
+opt-level = 2
 
 [[bin]]
 name = "dylex"

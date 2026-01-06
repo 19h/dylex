@@ -1,8 +1,15 @@
 //! File writer for assembled Mach-O output.
+//!
+//! # Performance
+//!
+//! Uses memory-mapped I/O for large files to avoid intermediate buffer allocation.
+//! Falls back to buffered I/O for smaller files where mmap overhead isn't worth it.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
+
+use memmap2::MmapMut;
 
 use crate::error::{Error, Result};
 use crate::macho::{
@@ -11,6 +18,9 @@ use crate::macho::{
 };
 
 use super::{ExtractionContext, WriteProcedure, WriteSource};
+
+/// Threshold for using mmap vs buffered I/O (1MB)
+const MMAP_THRESHOLD: u64 = 1024 * 1024;
 
 /// Page size for alignment.
 #[allow(dead_code)]
@@ -271,6 +281,12 @@ fn update_offset_field(ctx: &mut ExtractionContext, offset: usize, delta: i64) -
 }
 
 /// Writes the extracted Mach-O to a file.
+///
+/// # Performance
+///
+/// For files larger than 1MB, uses memory-mapped I/O to avoid allocating
+/// a large intermediate buffer. This reduces memory usage and can improve
+/// throughput on systems with fast storage.
 pub fn write_macho<P: AsRef<Path>>(
     ctx: &ExtractionContext,
     procedures: &[WriteProcedure],
@@ -286,13 +302,6 @@ pub fn write_macho<P: AsRef<Path>>(
         })?;
     }
 
-    let file = File::create(path).map_err(|e| Error::FileWrite {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-
-    let mut writer = BufWriter::new(file);
-
     // Calculate total size and round up to page boundary
     // Apple's dsc_extractor pads the file to page alignment (4096 bytes)
     let content_size = procedures
@@ -305,7 +314,112 @@ pub fn write_macho<P: AsRef<Path>>(
     let page_size = 4096u64;
     let total_size = (content_size + page_size - 1) & !(page_size - 1);
 
-    // Pre-allocate the file (with page padding)
+    // Use mmap for large files, buffered I/O for small files
+    if total_size >= MMAP_THRESHOLD {
+        write_macho_mmap(ctx, procedures, path, total_size)
+    } else {
+        write_macho_buffered(ctx, procedures, path, total_size)
+    }
+}
+
+/// Write using memory-mapped I/O (for large files).
+#[inline(never)]
+fn write_macho_mmap(
+    ctx: &ExtractionContext,
+    procedures: &[WriteProcedure],
+    path: &Path,
+    total_size: u64,
+) -> Result<()> {
+    // Create and set file size
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| Error::FileWrite {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+    file.set_len(total_size).map_err(|e| Error::FileWrite {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    // Memory map the file
+    let mut mmap = unsafe {
+        MmapMut::map_mut(&file).map_err(|e| Error::FileWrite {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::Other, e),
+        })?
+    };
+
+    // Execute write procedures directly to mmap
+    for proc in procedures {
+        let src_data = match proc.source {
+            WriteSource::Cache { subcache_index } => {
+                let cache_data = ctx.cache.data_for_subcache(subcache_index);
+                let start = proc.read_offset as usize;
+                let end = start + proc.size as usize;
+                if end <= cache_data.len() {
+                    &cache_data[start..end]
+                } else {
+                    continue;
+                }
+            }
+            WriteSource::Macho => {
+                let start = proc.read_offset as usize;
+                let end = start + proc.size as usize;
+                if end <= ctx.macho.data.len() {
+                    &ctx.macho.data[start..end]
+                } else {
+                    continue;
+                }
+            }
+            WriteSource::ExtraSegment => {
+                let start = proc.read_offset as usize;
+                let end = start + proc.size as usize;
+                if end <= ctx.extra_segment_data.len() {
+                    &ctx.extra_segment_data[start..end]
+                } else {
+                    continue;
+                }
+            }
+        };
+
+        let dst_start = proc.write_offset as usize;
+        let dst_end = dst_start + src_data.len();
+        if dst_end <= mmap.len() {
+            mmap[dst_start..dst_end].copy_from_slice(src_data);
+        }
+    }
+
+    // Flush to disk
+    mmap.flush().map_err(|e| Error::FileWrite {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    Ok(())
+}
+
+/// Write using buffered I/O (for small files).
+#[inline(never)]
+fn write_macho_buffered(
+    ctx: &ExtractionContext,
+    procedures: &[WriteProcedure],
+    path: &Path,
+    total_size: u64,
+) -> Result<()> {
+    let file = File::create(path).map_err(|e| Error::FileWrite {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    let mut writer = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
+
+    // Pre-allocate the output buffer
     let mut output = vec![0u8; total_size as usize];
 
     // Execute write procedures

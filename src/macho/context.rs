@@ -152,6 +152,14 @@ impl LoadCommandInfo {
 // Mach-O Context
 // =============================================================================
 
+/// Pre-computed segment range for fast address lookups.
+#[derive(Debug, Clone, Copy)]
+struct SegmentRange {
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: u64,
+}
+
 /// Context for working with a Mach-O file.
 ///
 /// This provides a high-level interface for reading and modifying Mach-O files,
@@ -168,6 +176,8 @@ pub struct MachOContext {
     pub load_commands: Vec<LoadCommandInfo>,
     /// Segment lookup by name
     segment_indices: HashMap<String, usize>,
+    /// Pre-computed segment ranges for fast address lookups (sorted by vmaddr)
+    segment_ranges: Vec<SegmentRange>,
 }
 
 impl MachOContext {
@@ -196,13 +206,34 @@ impl MachOContext {
             header: header.clone(),
             base_offset,
             data: data.to_vec(),
-            load_commands: Vec::new(),
+            load_commands: Vec::with_capacity(32), // Pre-allocate for typical dylib
             segment_indices: HashMap::new(),
+            segment_ranges: Vec::with_capacity(8), // Pre-allocate for typical segments
         };
 
         ctx.parse_load_commands()?;
+        ctx.build_segment_ranges();
 
         Ok(ctx)
+    }
+
+    /// Builds the segment_ranges cache for fast address lookups.
+    fn build_segment_ranges(&mut self) {
+        self.segment_ranges.clear();
+        // Collect segment data without borrowing self
+        for lc in &self.load_commands {
+            if let LoadCommandInfo::Segment(seg) = lc {
+                if seg.command.vmsize > 0 {
+                    self.segment_ranges.push(SegmentRange {
+                        vmaddr: seg.command.vmaddr,
+                        vmsize: seg.command.vmsize,
+                        fileoff: seg.command.fileoff,
+                    });
+                }
+            }
+        }
+        // Sort by vmaddr for binary search
+        self.segment_ranges.sort_by_key(|r| r.vmaddr);
     }
 
     /// Creates a context from a slice within a dyld cache.
@@ -564,6 +595,7 @@ impl MachOContext {
     }
 
     /// Reads data at the specified offset within the Mach-O.
+    #[inline]
     pub fn read_at(&self, offset: usize, len: usize) -> Result<&[u8]> {
         if offset + len > self.data.len() {
             return Err(Error::BufferTooSmall {
@@ -575,12 +607,14 @@ impl MachOContext {
     }
 
     /// Reads a u32 at the specified offset.
+    #[inline(always)]
     pub fn read_u32(&self, offset: usize) -> Result<u32> {
         let bytes = self.read_at(offset, 4)?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     /// Reads a u64 at the specified offset.
+    #[inline(always)]
     pub fn read_u64(&self, offset: usize) -> Result<u64> {
         let bytes = self.read_at(offset, 8)?;
         Ok(u64::from_le_bytes([
@@ -589,6 +623,7 @@ impl MachOContext {
     }
 
     /// Writes data at the specified offset.
+    #[inline]
     pub fn write_at(&mut self, offset: usize, data: &[u8]) -> Result<()> {
         if offset + data.len() > self.data.len() {
             return Err(Error::BufferTooSmall {
@@ -601,11 +636,13 @@ impl MachOContext {
     }
 
     /// Writes a u32 at the specified offset.
+    #[inline(always)]
     pub fn write_u32(&mut self, offset: usize, value: u32) -> Result<()> {
         self.write_at(offset, &value.to_le_bytes())
     }
 
     /// Writes a u64 at the specified offset.
+    #[inline(always)]
     pub fn write_u64(&mut self, offset: usize, value: u64) -> Result<()> {
         self.write_at(offset, &value.to_le_bytes())
     }
@@ -642,10 +679,18 @@ impl MachOContext {
     }
 
     /// Converts a virtual address to a file offset within this Mach-O.
+    /// Hot path - called for every pointer in slide info processing.
+    /// Uses binary search on pre-computed segment ranges for O(log n) lookup.
+    #[inline]
     pub fn addr_to_offset(&self, addr: u64) -> Option<usize> {
-        for seg in self.segments() {
-            if addr >= seg.command.vmaddr && addr < seg.command.vmaddr + seg.command.vmsize {
-                let offset = seg.command.fileoff + (addr - seg.command.vmaddr);
+        // Binary search: find the first segment where vmaddr + vmsize > addr
+        let idx = self
+            .segment_ranges
+            .partition_point(|r| r.vmaddr + r.vmsize <= addr);
+        if idx < self.segment_ranges.len() {
+            let range = &self.segment_ranges[idx];
+            if addr >= range.vmaddr && addr < range.vmaddr + range.vmsize {
+                let offset = range.fileoff + (addr - range.vmaddr);
                 return Some(offset as usize);
             }
         }

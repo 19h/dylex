@@ -602,30 +602,48 @@ impl DyldContext {
     }
 
     /// Converts a virtual address to a file offset.
+    /// Uses binary search for O(log n) lookup on sorted mappings.
+    #[inline]
     pub fn addr_to_offset(&self, addr: u64) -> Option<u64> {
-        for mapping in &self.mappings {
+        // Binary search for the mapping containing this address
+        let idx = self
+            .mappings
+            .partition_point(|m| m.address + m.size <= addr);
+        if idx < self.mappings.len() {
+            let mapping = &self.mappings[idx];
             if mapping.contains_addr(addr) {
                 return Some(mapping.addr_to_offset(addr));
             }
         }
-        None
+        // Fallback to linear search for edge cases
+        self.mappings
+            .iter()
+            .find(|m| m.contains_addr(addr))
+            .map(|m| m.addr_to_offset(addr))
     }
 
     /// Converts a file offset to a virtual address.
+    #[inline]
     pub fn offset_to_addr(&self, offset: u64) -> Option<u64> {
-        for mapping in &self.mappings {
-            if mapping.contains_offset(offset) {
-                return Some(mapping.offset_to_addr(offset));
-            }
-        }
-        None
+        // Mappings aren't sorted by file offset, so linear scan is necessary
+        self.mappings
+            .iter()
+            .find(|m| m.contains_offset(offset))
+            .map(|m| m.offset_to_addr(offset))
     }
 
     /// Returns the file data for a given address.
     ///
     /// This handles both the main cache and subcaches.
+    /// Uses binary search for efficient mapping lookup.
+    #[inline]
     pub fn data_at_addr(&self, addr: u64, len: usize) -> Result<&[u8]> {
-        for mapping in &self.mappings {
+        // Binary search for the mapping containing this address
+        let idx = self
+            .mappings
+            .partition_point(|m| m.address + m.size <= addr);
+        if idx < self.mappings.len() {
+            let mapping = &self.mappings[idx];
             if mapping.contains_addr(addr) {
                 let offset = mapping.addr_to_offset(addr) as usize;
                 let data = self.data_for_subcache(mapping.subcache_index);
@@ -642,6 +660,7 @@ impl DyldContext {
     }
 
     /// Returns the mmap data for a given subcache index.
+    #[inline]
     pub fn data_for_subcache(&self, index: usize) -> &[u8] {
         if index == 0 {
             &self.mmap[..]
@@ -653,8 +672,19 @@ impl DyldContext {
     }
 
     /// Returns the mapping for a given virtual address.
+    /// Uses binary search for O(log n) lookup.
+    #[inline]
     pub fn mapping_for_addr(&self, addr: u64) -> Option<&MappingEntry> {
-        self.mappings.iter().find(|m| m.contains_addr(addr))
+        let idx = self
+            .mappings
+            .partition_point(|m| m.address + m.size <= addr);
+        if idx < self.mappings.len() {
+            let mapping = &self.mappings[idx];
+            if mapping.contains_addr(addr) {
+                return Some(mapping);
+            }
+        }
+        None
     }
 
     /// Returns an iterator over all images.

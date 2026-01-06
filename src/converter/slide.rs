@@ -7,9 +7,15 @@
 //! - V2: Standard arm64 (non-PAC)
 //! - V3: arm64e with pointer authentication
 //! - V5: arm64e (iOS 18+, macOS 14.4+)
+//!
+//! # Performance
+//!
+//! Page processing is parallelized using rayon for significant speedup on
+//! multi-core systems. Each page is independent and can be processed in parallel.
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use tracing::{debug, trace};
 
 use crate::dyld::*;
@@ -17,6 +23,14 @@ use crate::error::{Error, Result};
 use crate::macho::MachOContext;
 
 use super::ExtractionContext;
+
+/// A single write operation to be applied to the Mach-O buffer.
+/// Collected during parallel processing, applied sequentially.
+#[derive(Clone, Copy)]
+struct WriteOp {
+    offset: usize,
+    value: u64,
+}
 
 /// Mapping info needed for slide processing.
 #[derive(Clone)]
@@ -106,6 +120,11 @@ pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
 /// The extracted binary keeps this format - no rebasing needed.
 ///
 /// For arm64 (non-PAC): Pointers need rebasing by adding value_add.
+///
+/// # Performance
+///
+/// Pages are processed in parallel using rayon. Each page's write operations
+/// are collected independently, then applied in a single pass.
 fn process_slide_info_v2(
     macho: &mut MachOContext,
     cache_data: &[u8],
@@ -131,6 +150,7 @@ fn process_slide_info_v2(
 
     let page_size = slide_info.page_size as u64;
     let page_starts_offset = offset + slide_info.page_starts_offset as usize;
+    let page_count = slide_info.page_starts_count as usize;
 
     let delta_mask = slide_info.delta_mask;
     let value_mask = slide_info.value_mask();
@@ -138,51 +158,74 @@ fn process_slide_info_v2(
     let delta_shift = slide_info.delta_shift();
 
     debug!(
-        "Slide v2: delta_mask={:#018x}, value_mask={:#018x}, value_add={:#018x}, delta_shift={}",
-        delta_mask, value_mask, value_add, delta_shift
+        "Slide v2: delta_mask={:#018x}, value_mask={:#018x}, value_add={:#018x}, delta_shift={}, pages={}",
+        delta_mask, value_mask, value_add, delta_shift, page_count
     );
 
-    // Process each page
-    for page_idx in 0..slide_info.page_starts_count as usize {
-        let page_start_offset = page_starts_offset + page_idx * 2;
-        let page_start = u16::from_le_bytes([
-            cache_data[page_start_offset],
-            cache_data[page_start_offset + 1],
-        ]);
+    // Collect page info for parallel processing
+    let page_infos: Vec<_> = (0..page_count)
+        .filter_map(|page_idx| {
+            let page_start_offset = page_starts_offset + page_idx * 2;
+            if page_start_offset + 2 > cache_data.len() {
+                return None;
+            }
+            let page_start = u16::from_le_bytes([
+                cache_data[page_start_offset],
+                cache_data[page_start_offset + 1],
+            ]);
 
-        // Skip pages with no rebasing needed
-        if page_start == (DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE & 0xFFFF) as u16 {
-            continue;
+            // Skip pages with no rebasing needed
+            if page_start == (DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE & 0xFFFF) as u16 {
+                return None;
+            }
+
+            let page_addr = mapping.address + (page_idx as u64 * page_size);
+            let start_offset = (page_start as u64) * 4; // 32-bit jumps
+            Some((page_addr + start_offset, page_idx))
+        })
+        .collect();
+
+    // Process pages in parallel, collecting write operations
+    let macho_data: &[u8] = &macho.data;
+    let all_writes: Vec<Vec<WriteOp>> = page_infos
+        .par_iter()
+        .map(|&(start_addr, _page_idx)| {
+            collect_v2_page_writes(
+                macho_data,
+                macho,
+                start_addr,
+                delta_mask,
+                value_mask,
+                value_add,
+                delta_shift,
+            )
+        })
+        .collect();
+
+    // Apply all writes (sequential, but the heavy computation was parallel)
+    for writes in all_writes {
+        for op in writes {
+            macho.data[op.offset..op.offset + 8].copy_from_slice(&op.value.to_le_bytes());
         }
-
-        let page_addr = mapping.address + (page_idx as u64 * page_size);
-
-        // Normal page processing
-        let start_offset = (page_start as u64) * 4; // 32-bit jumps
-        rebase_v2_page(
-            macho,
-            page_addr + start_offset,
-            delta_mask,
-            value_mask,
-            value_add,
-            delta_shift,
-        )?;
     }
 
     Ok(())
 }
 
-/// Rebases a single v2 page (for ARM64 non-PAC only).
-fn rebase_v2_page(
-    macho: &mut MachOContext,
+/// Collects write operations for a v2 page without modifying the buffer.
+#[inline]
+fn collect_v2_page_writes(
+    data: &[u8],
+    macho: &MachOContext,
     mut addr: u64,
     delta_mask: u64,
     value_mask: u64,
     value_add: u64,
     delta_shift: u32,
-) -> Result<()> {
+) -> Vec<WriteOp> {
+    let mut writes = Vec::with_capacity(64); // Pre-allocate for typical page
+
     loop {
-        // Try to convert address to Mach-O offset
         let macho_offset = match macho.addr_to_offset(addr) {
             Some(off) => off,
             None => {
@@ -191,7 +234,21 @@ fn rebase_v2_page(
             }
         };
 
-        let raw_value = macho.read_u64(macho_offset)?;
+        if macho_offset + 8 > data.len() {
+            break;
+        }
+
+        let raw_value = u64::from_le_bytes([
+            data[macho_offset],
+            data[macho_offset + 1],
+            data[macho_offset + 2],
+            data[macho_offset + 3],
+            data[macho_offset + 4],
+            data[macho_offset + 5],
+            data[macho_offset + 6],
+            data[macho_offset + 7],
+        ]);
+
         let delta = ((raw_value & delta_mask) >> delta_shift) as u64;
 
         // Calculate new value: mask out delta bits and add base address
@@ -200,8 +257,10 @@ fn rebase_v2_page(
             new_value += value_add;
         }
 
-        // Write back
-        macho.write_u64(macho_offset, new_value)?;
+        writes.push(WriteOp {
+            offset: macho_offset,
+            value: new_value,
+        });
 
         if delta == 0 {
             break;
@@ -210,10 +269,16 @@ fn rebase_v2_page(
         addr += delta * 4;
     }
 
-    Ok(())
+    writes
 }
 
+// Note: rebase_v2_page removed - replaced by parallel collect_v2_page_writes
+
 /// Processes slide info version 3 (arm64e with PAC).
+///
+/// # Performance
+///
+/// Pages are processed in parallel using rayon.
 fn process_slide_info_v3(
     macho: &mut MachOContext,
     cache_data: &[u8],
@@ -231,33 +296,66 @@ fn process_slide_info_v3(
 
     let page_size = slide_info.page_size as u64;
     let auth_value_add = slide_info.auth_value_add;
+    let page_count = slide_info.page_starts_count as usize;
 
     // Page starts immediately follow the header
     let page_starts_offset = offset + std::mem::size_of::<DyldCacheSlideInfo3>();
 
-    for page_idx in 0..slide_info.page_starts_count as usize {
-        let page_start_offset = page_starts_offset + page_idx * 2;
-        let page_start = u16::from_le_bytes([
-            cache_data[page_start_offset],
-            cache_data[page_start_offset + 1],
-        ]);
+    debug!(
+        "Slide v3: auth_value_add={:#018x}, pages={}",
+        auth_value_add, page_count
+    );
 
-        // Skip pages with no rebasing
-        if page_start == DYLD_CACHE_SLIDE_V3_PAGE_ATTR_NO_REBASE {
-            continue;
+    // Collect page info for parallel processing
+    let page_infos: Vec<_> = (0..page_count)
+        .filter_map(|page_idx| {
+            let page_start_offset = page_starts_offset + page_idx * 2;
+            if page_start_offset + 2 > cache_data.len() {
+                return None;
+            }
+            let page_start = u16::from_le_bytes([
+                cache_data[page_start_offset],
+                cache_data[page_start_offset + 1],
+            ]);
+
+            // Skip pages with no rebasing
+            if page_start == DYLD_CACHE_SLIDE_V3_PAGE_ATTR_NO_REBASE {
+                return None;
+            }
+
+            let page_addr = mapping.address + (page_idx as u64 * page_size);
+            let initial_offset = (page_start as u64) * 8; // 8-byte stride
+            Some(page_addr + initial_offset)
+        })
+        .collect();
+
+    // Process pages in parallel
+    let macho_data: &[u8] = &macho.data;
+    let all_writes: Vec<Vec<WriteOp>> = page_infos
+        .par_iter()
+        .map(|&start_addr| collect_v3_page_writes(macho_data, macho, start_addr, auth_value_add))
+        .collect();
+
+    // Apply all writes
+    for writes in all_writes {
+        for op in writes {
+            macho.data[op.offset..op.offset + 8].copy_from_slice(&op.value.to_le_bytes());
         }
-
-        let page_addr = mapping.address + (page_idx as u64 * page_size);
-        let initial_offset = (page_start as u64) * 8; // 8-byte stride
-
-        rebase_v3_page(macho, page_addr + initial_offset, auth_value_add)?;
     }
 
     Ok(())
 }
 
-/// Rebases a single v3 page.
-fn rebase_v3_page(macho: &mut MachOContext, mut addr: u64, auth_value_add: u64) -> Result<()> {
+/// Collects write operations for a v3 page without modifying the buffer.
+#[inline]
+fn collect_v3_page_writes(
+    data: &[u8],
+    macho: &MachOContext,
+    mut addr: u64,
+    auth_value_add: u64,
+) -> Vec<WriteOp> {
+    let mut writes = Vec::with_capacity(64);
+
     loop {
         let macho_offset = match macho.addr_to_offset(addr) {
             Some(off) => off,
@@ -267,7 +365,21 @@ fn rebase_v3_page(macho: &mut MachOContext, mut addr: u64, auth_value_add: u64) 
             }
         };
 
-        let raw_value = macho.read_u64(macho_offset)?;
+        if macho_offset + 8 > data.len() {
+            break;
+        }
+
+        let raw_value = u64::from_le_bytes([
+            data[macho_offset],
+            data[macho_offset + 1],
+            data[macho_offset + 2],
+            data[macho_offset + 3],
+            data[macho_offset + 4],
+            data[macho_offset + 5],
+            data[macho_offset + 6],
+            data[macho_offset + 7],
+        ]);
+
         let ptr = SlidePointer3(raw_value);
         let delta = ptr.offset_to_next() * 8;
 
@@ -279,7 +391,10 @@ fn rebase_v3_page(macho: &mut MachOContext, mut addr: u64, auth_value_add: u64) 
             ptr.plain_value()
         };
 
-        macho.write_u64(macho_offset, new_value)?;
+        writes.push(WriteOp {
+            offset: macho_offset,
+            value: new_value,
+        });
 
         if delta == 0 {
             break;
@@ -287,10 +402,16 @@ fn rebase_v3_page(macho: &mut MachOContext, mut addr: u64, auth_value_add: u64) 
         addr += delta;
     }
 
-    Ok(())
+    writes
 }
 
+// Note: rebase_v3_page removed - replaced by parallel collect_v3_page_writes
+
 /// Processes slide info version 5 (arm64e iOS 18+).
+///
+/// # Performance
+///
+/// Pages are processed in parallel using rayon.
 fn process_slide_info_v5(
     macho: &mut MachOContext,
     cache_data: &[u8],
@@ -308,33 +429,66 @@ fn process_slide_info_v5(
 
     let page_size = slide_info.page_size as u64;
     let value_add = slide_info.value_add;
+    let page_count = slide_info.page_starts_count as usize;
 
     // Page starts immediately follow the header
     let page_starts_offset = offset + std::mem::size_of::<DyldCacheSlideInfo5>();
 
-    for page_idx in 0..slide_info.page_starts_count as usize {
-        let page_start_offset = page_starts_offset + page_idx * 2;
-        let page_start = u16::from_le_bytes([
-            cache_data[page_start_offset],
-            cache_data[page_start_offset + 1],
-        ]);
+    debug!(
+        "Slide v5: value_add={:#018x}, pages={}",
+        value_add, page_count
+    );
 
-        // Skip pages with no rebasing
-        if page_start == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE {
-            continue;
+    // Collect page info for parallel processing
+    let page_infos: Vec<_> = (0..page_count)
+        .filter_map(|page_idx| {
+            let page_start_offset = page_starts_offset + page_idx * 2;
+            if page_start_offset + 2 > cache_data.len() {
+                return None;
+            }
+            let page_start = u16::from_le_bytes([
+                cache_data[page_start_offset],
+                cache_data[page_start_offset + 1],
+            ]);
+
+            // Skip pages with no rebasing
+            if page_start == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE {
+                return None;
+            }
+
+            let page_addr = mapping.address + (page_idx as u64 * page_size);
+            let initial_offset = (page_start as u64) * 8;
+            Some(page_addr + initial_offset)
+        })
+        .collect();
+
+    // Process pages in parallel
+    let macho_data: &[u8] = &macho.data;
+    let all_writes: Vec<Vec<WriteOp>> = page_infos
+        .par_iter()
+        .map(|&start_addr| collect_v5_page_writes(macho_data, macho, start_addr, value_add))
+        .collect();
+
+    // Apply all writes
+    for writes in all_writes {
+        for op in writes {
+            macho.data[op.offset..op.offset + 8].copy_from_slice(&op.value.to_le_bytes());
         }
-
-        let page_addr = mapping.address + (page_idx as u64 * page_size);
-        let initial_offset = (page_start as u64) * 8;
-
-        rebase_v5_page(macho, page_addr + initial_offset, value_add)?;
     }
 
     Ok(())
 }
 
-/// Rebases a single v5 page.
-fn rebase_v5_page(macho: &mut MachOContext, mut addr: u64, value_add: u64) -> Result<()> {
+/// Collects write operations for a v5 page without modifying the buffer.
+#[inline]
+fn collect_v5_page_writes(
+    data: &[u8],
+    macho: &MachOContext,
+    mut addr: u64,
+    value_add: u64,
+) -> Vec<WriteOp> {
+    let mut writes = Vec::with_capacity(64);
+
     loop {
         let macho_offset = match macho.addr_to_offset(addr) {
             Some(off) => off,
@@ -344,7 +498,21 @@ fn rebase_v5_page(macho: &mut MachOContext, mut addr: u64, value_add: u64) -> Re
             }
         };
 
-        let raw_value = macho.read_u64(macho_offset)?;
+        if macho_offset + 8 > data.len() {
+            break;
+        }
+
+        let raw_value = u64::from_le_bytes([
+            data[macho_offset],
+            data[macho_offset + 1],
+            data[macho_offset + 2],
+            data[macho_offset + 3],
+            data[macho_offset + 4],
+            data[macho_offset + 5],
+            data[macho_offset + 6],
+            data[macho_offset + 7],
+        ]);
+
         let ptr = SlidePointer5(raw_value);
         let delta = ptr.next() * 8;
 
@@ -358,7 +526,10 @@ fn rebase_v5_page(macho: &mut MachOContext, mut addr: u64, value_add: u64) -> Re
             runtime_offset + value_add + high8
         };
 
-        macho.write_u64(macho_offset, new_value)?;
+        writes.push(WriteOp {
+            offset: macho_offset,
+            value: new_value,
+        });
 
         if delta == 0 {
             break;
@@ -366,5 +537,7 @@ fn rebase_v5_page(macho: &mut MachOContext, mut addr: u64, value_add: u64) -> Re
         addr += delta;
     }
 
-    Ok(())
+    writes
 }
+
+// Note: rebase_v5_page removed - replaced by parallel collect_v5_page_writes

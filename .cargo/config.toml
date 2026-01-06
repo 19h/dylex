@@ -1,0 +1,21 @@
+# Optimize for the native CPU architecture
+# This enables AVX2, SSE4.2, and other CPU-specific instructions
+
+[build]
+# Use native CPU features for maximum performance
+rustflags = ["-C", "target-cpu=native"]
+
+# Alternative: Uncomment for specific architectures
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "target-cpu=apple-m1"]
+
+# [target.x86_64-apple-darwin]
+# rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+bmi1,+bmi2"]
+
+[profile.release]
+# Enable frame pointers for better profiling (comment out for absolute max perf)
+# rustflags = ["-C", "force-frame-pointers=yes"]
+
+[env]
+# Optimize memcpy/memset using SIMD
+RUSTFLAGS = "-C target-cpu=native"

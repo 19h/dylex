@@ -132,13 +132,14 @@ pub fn extract_image_with_options<P: AsRef<Path>>(
     // Parse load commands to find all segment info
     // We need to build a complete Mach-O buffer that contains all segment data
     // positioned at their file offsets as specified in the load commands
-    #[derive(Clone)]
+    #[derive(Clone, Copy)]
     struct SegmentToCopy {
         vmaddr: u64,
         fileoff: u64,
         filesize: u64,
     }
-    let mut segments: Vec<SegmentToCopy> = Vec::new();
+    // Pre-allocate for typical dylib (usually 4-6 segments)
+    let mut segments: Vec<SegmentToCopy> = Vec::with_capacity(8);
     let mut max_file_end: u64 = header_and_cmds_size as u64;
 
     let mut offset = MachHeader64::SIZE;
