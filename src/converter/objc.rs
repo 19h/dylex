@@ -62,9 +62,12 @@ const OLD_METHOD_SIZE: usize = 24;
 /// Fixes ObjC metadata in the extracted image.
 ///
 /// This function performs the following fixes:
-/// 1. Clears the OBJC_IMAGE_OPTIMIZED_BY_DYLD flag
-/// 2. Fixes method lists with direct selector references
-/// 3. Clears the uniqued selectors flag from method lists
+/// 1. Fixes method lists with direct selector references
+/// 2. Clears the uniqued selectors flag from method lists
+///
+/// Note: The OBJC_IMAGE_OPTIMIZED_BY_DYLD flag is preserved because the
+/// ObjC metadata is still in its optimized form after extraction.
+/// Apple's dsc_extractor also preserves this flag.
 pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
     // Find __objc_imageinfo section
     let imageinfo = ctx
@@ -100,9 +103,8 @@ pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
 
     ctx.info("Fixing ObjC metadata...");
 
-    // Clear the optimized-by-dyld flag
-    let new_flags = flags & !OBJC_IMAGE_OPTIMIZED_BY_DYLD;
-    ctx.macho.data[offset + 4..offset + 8].copy_from_slice(&new_flags.to_le_bytes());
+    // Note: We preserve OBJC_IMAGE_OPTIMIZED_BY_DYLD flag - Apple's dsc_extractor
+    // does the same. The metadata is still optimized after extraction.
 
     // Fix method lists in classes
     let mut fixed_methods = 0;

@@ -8,6 +8,7 @@
 //!
 //! The extraction follows this order (reverse of cache building):
 //!
+//! 0. **Header Fixup** - Clears MH_DYLIB_IN_CACHE flag and zeros chained fixups
 //! 1. **Slide Info Processing** - Rebases pointers by removing ASLR slide encoding
 //! 2. **LINKEDIT Optimization** - Rebuilds the merged LINKEDIT segment
 //! 3. **Stub Fixing** - Restores optimized stubs to use lazy binding
@@ -15,6 +16,7 @@
 //! 5. **Offset Optimization** - Compacts file offsets for smaller output
 
 mod context;
+mod fixup;
 mod linkedit;
 mod objc;
 mod slide;
@@ -22,6 +24,7 @@ mod stub;
 mod writer;
 
 pub use context::*;
+pub use fixup::*;
 pub use linkedit::*;
 pub use objc::*;
 pub use slide::*;

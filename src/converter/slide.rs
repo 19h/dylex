@@ -100,7 +100,12 @@ pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
     Ok(())
 }
 
-/// Processes slide info version 2 (standard arm64).
+/// Processes slide info version 2 (standard arm64 and x86_64).
+///
+/// For x86_64: Pointers are already in offset format with embedded delta chain.
+/// The extracted binary keeps this format - no rebasing needed.
+///
+/// For arm64 (non-PAC): Pointers need rebasing by adding value_add.
 fn process_slide_info_v2(
     macho: &mut MachOContext,
     cache_data: &[u8],
@@ -108,6 +113,14 @@ fn process_slide_info_v2(
     mapping: &SlideMapping,
 ) -> Result<()> {
     use zerocopy::FromBytes;
+
+    // For x86_64, pointers are already in the correct format (offset + delta).
+    // The extracted binary keeps this format for dyld to process at load time.
+    // No rebasing transformation is needed.
+    if macho.header.is_x86_64() {
+        debug!("Slide v2: skipping rebasing for x86_64 (pointers already in offset format)");
+        return Ok(());
+    }
 
     let slide_info = DyldCacheSlideInfo2::read_from_prefix(&cache_data[offset..])
         .map_err(|_| Error::InvalidSlideInfo {
@@ -123,6 +136,11 @@ fn process_slide_info_v2(
     let value_mask = slide_info.value_mask();
     let value_add = slide_info.value_add;
     let delta_shift = slide_info.delta_shift();
+
+    debug!(
+        "Slide v2: delta_mask={:#018x}, value_mask={:#018x}, value_add={:#018x}, delta_shift={}",
+        delta_mask, value_mask, value_add, delta_shift
+    );
 
     // Process each page
     for page_idx in 0..slide_info.page_starts_count as usize {
@@ -154,7 +172,7 @@ fn process_slide_info_v2(
     Ok(())
 }
 
-/// Rebases a single v2 page.
+/// Rebases a single v2 page (for ARM64 non-PAC only).
 fn rebase_v2_page(
     macho: &mut MachOContext,
     mut addr: u64,
@@ -176,7 +194,7 @@ fn rebase_v2_page(
         let raw_value = macho.read_u64(macho_offset)?;
         let delta = ((raw_value & delta_mask) >> delta_shift) as u64;
 
-        // Calculate new value
+        // Calculate new value: mask out delta bits and add base address
         let mut new_value = raw_value & value_mask;
         if new_value != 0 {
             new_value += value_add;
@@ -188,7 +206,8 @@ fn rebase_v2_page(
         if delta == 0 {
             break;
         }
-        addr += delta;
+        // Delta is in 4-byte units for v2
+        addr += delta * 4;
     }
 
     Ok(())

@@ -50,8 +50,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use converter::{
-    ExtractionContext, fix_objc, fix_stubs, optimize_linkedit, optimize_offsets,
-    process_slide_info, write_macho,
+    ExtractionContext, fix_header_and_load_commands, fix_objc, fix_stubs, optimize_linkedit,
+    optimize_offsets, process_slide_info, write_macho,
 };
 
 /// Extracts a single image from the cache.
@@ -240,6 +240,11 @@ pub fn extract_image_with_options<P: AsRef<Path>>(
     let mut ctx =
         ExtractionContext::new(Arc::clone(cache), macho, image.path.clone(), image.address)
             .with_verbosity(options.verbosity);
+
+    // CRITICAL: Fix header and load commands first
+    // This clears MH_DYLIB_IN_CACHE flag and zeros chained fixups
+    // Apple's dsc_extractor does this at the very start
+    fix_header_and_load_commands(&mut ctx)?;
 
     // Run extraction pipeline
     if !options.skip_slide_info {

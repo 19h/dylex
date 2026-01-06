@@ -13,24 +13,27 @@ use crate::macho::{
 use super::{ExtractionContext, WriteProcedure, WriteSource};
 
 /// Page size for alignment.
+#[allow(dead_code)]
 const PAGE_SIZE: u64 = 0x4000;
 
 /// Optimizes file offsets and generates write procedures.
 ///
 /// This function computes new, compact file offsets for all segments
 /// and updates the segment commands in the Mach-O to reflect these new offsets.
+///
+/// The TEXT segment starts at file offset 0 (standard Mach-O layout where
+/// the header is part of the TEXT segment). The header and load commands
+/// are written as part of the TEXT segment, not separately.
 pub fn optimize_offsets(ctx: &mut ExtractionContext) -> Result<Vec<WriteProcedure>> {
     ctx.info("Optimizing file offsets...");
 
     let mut procedures = Vec::new();
 
-    // Write header and load commands from the MachOContext (which may have been modified)
-    let header_size = ctx.macho.header.sizeofcmds as u64 + 32; // Header + load commands
-    procedures.push(WriteProcedure::from_macho(0, 0, header_size));
-    let mut write_offset = align_to(header_size, PAGE_SIZE);
+    // The header and load commands will be written at offset 0
+    // (as part of the TEXT segment's file range)
+    let header_size = ctx.macho.header.sizeofcmds as u64 + 32;
 
     // Collect segment info first (to avoid borrow issues)
-    // Also track the old and new LINKEDIT offset
     let segment_info: Vec<(usize, u64, u64, bool, String)> = ctx
         .macho
         .segments()
@@ -50,6 +53,10 @@ pub fn optimize_offsets(ctx: &mut ExtractionContext) -> Result<Vec<WriteProcedur
     let mut old_linkedit_off: Option<u64> = None;
     let mut new_linkedit_off: Option<u64> = None;
 
+    // Start writing at offset 0
+    let mut write_offset: u64 = 0;
+    let mut is_first_segment = true;
+
     // Process each segment - update file offsets and create write procedures
     for (cmd_offset, old_fileoff, filesize, is_linkedit, _seg_name) in segment_info {
         if is_linkedit {
@@ -57,39 +64,80 @@ pub fn optimize_offsets(ctx: &mut ExtractionContext) -> Result<Vec<WriteProcedur
             new_linkedit_off = Some(write_offset);
         }
 
-        // Create write procedure: read from old offset in macho buffer, write at new offset
-        procedures.push(WriteProcedure::from_macho(
-            write_offset,
-            old_fileoff,
-            filesize,
-        ));
+        // For the first segment (TEXT), the header is at the start
+        if is_first_segment {
+            // Write header and load commands first (from offset 0 in macho buffer)
+            procedures.push(WriteProcedure::from_macho(0, 0, header_size));
 
-        // Update the segment command's fileoff in the Mach-O buffer
-        // The fileoff field is at offset 40 within the segment command
-        let fileoff_offset = cmd_offset + 40;
-        ctx.macho.write_u64(fileoff_offset, write_offset)?;
-
-        // Also update section file offsets within this segment
-        // Sections start after the segment command (72 bytes) and are 80 bytes each
-        let nsects_offset = cmd_offset + 64;
-        let nsects = ctx.macho.read_u32(nsects_offset)? as usize;
-
-        for i in 0..nsects {
-            let section_offset = cmd_offset + 72 + i * 80;
-            // Section offset field is at offset 48 within the section
-            let sect_offset_field = section_offset + 48;
-            let old_sect_offset = ctx.macho.read_u32(sect_offset_field)?;
-
-            if old_sect_offset != 0 {
-                // Calculate new section offset relative to the new segment offset
-                let delta = old_sect_offset as u64 - old_fileoff;
-                let new_sect_offset = (write_offset + delta) as u32;
-                ctx.macho.write_u32(sect_offset_field, new_sect_offset)?;
+            // Write the rest of TEXT segment data (excluding the header portion)
+            // The segment data in macho buffer is at old_fileoff, but the first
+            // header_size bytes of the segment overlap with the header
+            let data_start = old_fileoff + header_size;
+            let data_size = filesize - header_size;
+            if data_size > 0 {
+                procedures.push(WriteProcedure::from_macho(
+                    header_size,
+                    data_start,
+                    data_size,
+                ));
             }
-        }
 
-        write_offset += filesize;
-        write_offset = align_to(write_offset, PAGE_SIZE);
+            // Update the segment command's fileoff to 0
+            let fileoff_offset = cmd_offset + 40;
+            ctx.macho.write_u64(fileoff_offset, 0)?;
+
+            // Update section file offsets - they need to account for the new layout
+            let nsects_offset = cmd_offset + 64;
+            let nsects = ctx.macho.read_u32(nsects_offset)? as usize;
+
+            for i in 0..nsects {
+                let section_offset = cmd_offset + 72 + i * 80;
+                let sect_offset_field = section_offset + 48;
+                let old_sect_offset = ctx.macho.read_u32(sect_offset_field)?;
+
+                if old_sect_offset != 0 {
+                    // Section offset relative to segment start stays the same
+                    // New offset = old_offset - old_fileoff (relative offset in segment)
+                    let relative_offset = old_sect_offset as u64 - old_fileoff;
+                    ctx.macho
+                        .write_u32(sect_offset_field, relative_offset as u32)?;
+                }
+            }
+
+            write_offset = filesize;
+            is_first_segment = false;
+        } else {
+            // No page alignment between segments - pack contiguously
+            // (This matches Apple's dsc_extractor behavior)
+
+            // Create write procedure
+            procedures.push(WriteProcedure::from_macho(
+                write_offset,
+                old_fileoff,
+                filesize,
+            ));
+
+            // Update segment and section offsets
+            let fileoff_offset = cmd_offset + 40;
+            ctx.macho.write_u64(fileoff_offset, write_offset)?;
+
+            let nsects_offset = cmd_offset + 64;
+            let nsects = ctx.macho.read_u32(nsects_offset)? as usize;
+
+            for i in 0..nsects {
+                let section_offset = cmd_offset + 72 + i * 80;
+                let sect_offset_field = section_offset + 48;
+                let old_sect_offset = ctx.macho.read_u32(sect_offset_field)?;
+
+                if old_sect_offset != 0 {
+                    let delta = old_sect_offset as u64 - old_fileoff;
+                    let new_sect_offset = (write_offset + delta) as u32;
+                    ctx.macho.write_u32(sect_offset_field, new_sect_offset)?;
+                }
+            }
+
+            write_offset += filesize;
+        }
     }
 
     // Add extra segment if present
@@ -245,14 +293,19 @@ pub fn write_macho<P: AsRef<Path>>(
 
     let mut writer = BufWriter::new(file);
 
-    // Calculate total size
-    let total_size = procedures
+    // Calculate total size and round up to page boundary
+    // Apple's dsc_extractor pads the file to page alignment (4096 bytes)
+    let content_size = procedures
         .iter()
         .map(|p| p.write_offset + p.size)
         .max()
         .unwrap_or(0);
 
-    // Pre-allocate the file
+    // Round up to page boundary (4096 bytes)
+    let page_size = 4096u64;
+    let total_size = (content_size + page_size - 1) & !(page_size - 1);
+
+    // Pre-allocate the file (with page padding)
     let mut output = vec![0u8; total_size as usize];
 
     // Execute write procedures
@@ -310,6 +363,7 @@ pub fn write_macho<P: AsRef<Path>>(
 
 /// Aligns a value to the given boundary.
 #[inline]
+#[allow(dead_code)]
 fn align_to(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
 }

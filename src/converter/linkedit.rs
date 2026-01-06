@@ -13,8 +13,8 @@ use crate::dyld::{
 use crate::error::{Error, Result};
 use crate::macho::{
     DyldInfoCommand, DysymtabCommand, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_DATA_IN_CODE,
-    LC_DYLD_EXPORTS_TRIE, LC_FUNCTION_STARTS, LinkeditDataCommand, LoadCommandInfo, Nlist64,
-    SymtabCommand,
+    LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_FUNCTION_STARTS, LinkeditDataCommand,
+    LoadCommandInfo, Nlist64, SymtabCommand,
 };
 
 use super::ExtractionContext;
@@ -25,61 +25,45 @@ use super::ExtractionContext;
 
 /// A string pool for building the new LINKEDIT string table.
 ///
-/// Deduplicates strings and tracks their offsets in the final table.
+/// Stores strings sequentially without deduplication to match Apple's dsc_extractor.
 #[derive(Debug)]
 struct StringPool {
-    /// Map from string content to offset in pool
-    map: HashMap<Vec<u8>, u32>,
-    /// Current size of the pool
-    size: u32,
+    /// Raw string data
+    data: Vec<u8>,
 }
 
 impl StringPool {
     /// Creates a new string pool with the initial null byte.
     fn new() -> Self {
-        let mut pool = Self {
-            map: HashMap::new(),
-            size: 0,
-        };
-        // First string is always a null byte (index 0)
-        pool.map.insert(vec![0], 0);
-        pool.size = 1;
+        let mut pool = Self { data: Vec::new() };
+        // First byte is always a null byte (empty string at index 0)
+        pool.data.push(0);
         pool
     }
 
     /// Adds a string to the pool and returns its offset.
     ///
-    /// If the string already exists, returns the existing offset.
+    /// Unlike a traditional string pool, this does NOT deduplicate strings
+    /// to match Apple's dsc_extractor behavior exactly.
     fn add(&mut self, s: &[u8]) -> u32 {
-        // Ensure null termination
-        let mut key = s.to_vec();
-        if key.last() != Some(&0) {
-            key.push(0);
-        }
+        let offset = self.data.len() as u32;
 
-        if let Some(&offset) = self.map.get(&key) {
-            return offset;
-        }
+        // Copy the string (without null terminator if present)
+        let s = if s.last() == Some(&0) {
+            &s[..s.len() - 1]
+        } else {
+            s
+        };
 
-        let offset = self.size;
-        self.size += key.len() as u32;
-        self.map.insert(key, offset);
+        self.data.extend_from_slice(s);
+        self.data.push(0); // Add null terminator
+
         offset
     }
 
-    /// Compiles the string pool into a byte vector.
+    /// Returns the compiled string pool data.
     fn compile(&self) -> Vec<u8> {
-        let mut result = vec![0u8; self.size as usize];
-
-        for (string, &offset) in &self.map {
-            let offset = offset as usize;
-            let len = string.len();
-            if offset + len <= result.len() {
-                result[offset..offset + len].copy_from_slice(string);
-            }
-        }
-
-        result
+        self.data.clone()
     }
 }
 
@@ -119,6 +103,8 @@ struct LinkeditOptimizer<'a> {
     function_starts: Option<LinkeditDataCommand>,
     data_in_code_offset: Option<usize>,
     data_in_code: Option<LinkeditDataCommand>,
+    chained_fixups_offset: Option<usize>,
+    chained_fixups: Option<LinkeditDataCommand>,
 
     // New offsets within the rebuilt LINKEDIT
     new_bind_offset: u32,
@@ -163,6 +149,8 @@ impl<'a> LinkeditOptimizer<'a> {
             function_starts: None,
             data_in_code_offset: None,
             data_in_code: None,
+            chained_fixups_offset: None,
+            chained_fixups: None,
             new_bind_offset: 0,
             new_weak_bind_offset: 0,
             new_lazy_bind_offset: 0,
@@ -211,6 +199,10 @@ impl<'a> LinkeditOptimizer<'a> {
                         self.export_trie = Some(*command);
                         self.export_trie_offset = Some(*offset);
                     }
+                    LC_DYLD_CHAINED_FIXUPS => {
+                        self.chained_fixups = Some(*command);
+                        self.chained_fixups_offset = Some(*offset);
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -256,6 +248,7 @@ impl<'a> LinkeditOptimizer<'a> {
     }
 
     /// Copies binding info to the new LINKEDIT.
+    #[allow(dead_code)]
     fn copy_binding_info(&mut self) -> Result<()> {
         let Some(dyld_info) = self.dyld_info else {
             return Ok(());
@@ -292,6 +285,7 @@ impl<'a> LinkeditOptimizer<'a> {
     }
 
     /// Copies export info to the new LINKEDIT.
+    #[allow(dead_code)]
     fn copy_export_info(&mut self) -> Result<()> {
         // Check for LC_DYLD_EXPORTS_TRIE first (newer format)
         if let Some(export_trie) = self.export_trie {
@@ -368,16 +362,71 @@ impl<'a> LinkeditOptimizer<'a> {
         Ok(())
     }
 
-    /// Copies local symbols from the symbols cache.
+    /// Copies local symbols from the dylib's original symbol table.
+    ///
+    /// Local symbols are referenced by dysymtab.ilocalsym and dysymtab.nlocalsym,
+    /// and the actual nlist entries are in the symtab at the appropriate offsets.
     fn copy_local_symbols(&mut self) -> Result<()> {
+        let Some(dysymtab) = self.dysymtab else {
+            return Ok(());
+        };
+
+        let Some(symtab) = self.symtab else {
+            return Ok(());
+        };
+
+        if dysymtab.nlocalsym == 0 {
+            return Ok(());
+        }
+
+        self.new_local_sym_index = self.symbol_count;
+
+        let sym_start = dysymtab.ilocalsym;
+        let sym_end = sym_start + dysymtab.nlocalsym;
+
+        for sym_index in sym_start..sym_end {
+            let nlist_offset = symtab.symoff as usize + (sym_index as usize * Nlist64::SIZE);
+
+            let nlist_data = self.read_linkedit_data(nlist_offset as u32, Nlist64::SIZE as u32)?;
+            let (nlist, _) = Nlist64::read_from_prefix(nlist_data).map_err(|_| Error::Parse {
+                offset: nlist_offset,
+                reason: "failed to parse nlist".into(),
+            })?;
+
+            // Read the symbol name
+            let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
+            let name_data = self.read_linkedit_data(name_offset as u32, 4096)?;
+            let name = self.extract_string(name_data);
+
+            // Map old index to new
+            self.old_to_new_symbol_index
+                .insert(sym_index, self.symbol_count);
+
+            // Add to our string pool and create new entry
+            let new_strx = self.string_pool.add(&name);
+
+            let mut new_nlist = nlist;
+            new_nlist.n_strx = new_strx;
+
+            self.new_linkedit.extend_from_slice(new_nlist.as_bytes());
+            self.symbol_count += 1;
+            self.new_local_sym_count += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Copies local symbols from the symbols cache (for caches with separate local symbols).
+    ///
+    /// This is used for older caches that store local symbols in a separate table
+    /// (local_symbols_offset != 0 or .symbols file exists).
+    #[allow(dead_code)]
+    fn copy_local_symbols_from_cache(&mut self) -> Result<()> {
         let Some(symbols_data) = self.ctx.cache.symbols_cache_data() else {
-            self.ctx
-                .warn("No symbols cache available for local symbols");
             return Ok(());
         };
 
         let Some(local_symbols_info) = self.ctx.cache.local_symbols_info else {
-            self.ctx.warn("No local symbols info available");
             return Ok(());
         };
 
@@ -572,7 +621,7 @@ impl<'a> LinkeditOptimizer<'a> {
 
             // Read the symbol name
             let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
-            let name_data = self.read_linkedit_data(name_offset as u32, 256)?; // Read up to 256 bytes
+            let name_data = self.read_linkedit_data(name_offset as u32, 4096)?;
             let name = self.extract_string(name_data);
 
             // Map old index to new
@@ -623,7 +672,7 @@ impl<'a> LinkeditOptimizer<'a> {
 
             // Read the symbol name
             let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
-            let name_data = self.read_linkedit_data(name_offset as u32, 256)?;
+            let name_data = self.read_linkedit_data(name_offset as u32, 4096)?;
             let name = self.extract_string(name_data);
 
             // Map old index to new
@@ -759,6 +808,7 @@ impl<'a> LinkeditOptimizer<'a> {
     }
 
     /// Aligns the LINKEDIT to 8 bytes.
+    #[allow(dead_code)]
     fn align_linkedit(&mut self) {
         let alignment = 8;
         let remainder = self.new_linkedit.len() % alignment;
@@ -770,9 +820,18 @@ impl<'a> LinkeditOptimizer<'a> {
     }
 
     /// Copies the string pool to the LINKEDIT.
+    ///
+    /// The string pool is padded to 8-byte alignment to match Apple's dsc_extractor.
     fn copy_string_pool(&mut self) {
         self.new_string_pool_offset = self.new_linkedit.len() as u32;
-        let pool = self.string_pool.compile();
+        let mut pool = self.string_pool.compile();
+
+        // Pad to 8-byte alignment (Apple's dsc_extractor does this)
+        let padding = (8 - (pool.len() % 8)) % 8;
+        for _ in 0..padding {
+            pool.push(0);
+        }
+
         self.new_string_pool_size = pool.len() as u32;
         self.new_linkedit.extend_from_slice(&pool);
     }
@@ -783,7 +842,10 @@ impl<'a> LinkeditOptimizer<'a> {
         if let Some(linkedit_seg) = self.ctx.macho.segment_mut("__LINKEDIT") {
             linkedit_seg.command.fileoff = new_linkedit_offset as u64;
             linkedit_seg.command.filesize = self.new_linkedit.len() as u64;
-            linkedit_seg.command.vmsize = self.new_linkedit.len() as u64;
+            // vmsize should be page-aligned (Apple's dsc_extractor does this)
+            let filesize = self.new_linkedit.len() as u64;
+            let page_size = 0x1000u64;
+            linkedit_seg.command.vmsize = (filesize + page_size - 1) & !(page_size - 1);
         }
 
         // Write back to data buffer (separate borrow scope)
@@ -842,10 +904,12 @@ impl<'a> LinkeditOptimizer<'a> {
             self.ctx.macho.write_struct(offset, &dyld_info)?;
         }
 
-        // Update export trie
+        // Zero out export trie - Apple's dsc_extractor does this
+        // The export info is available in the symbol table
         if let Some(offset) = self.export_trie_offset {
             let mut export_trie = self.export_trie.unwrap();
-            export_trie.dataoff = new_linkedit_offset + self.new_export_offset;
+            export_trie.dataoff = 0;
+            export_trie.datasize = 0;
             self.ctx.macho.write_struct(offset, &export_trie)?;
         }
 
@@ -862,63 +926,103 @@ impl<'a> LinkeditOptimizer<'a> {
         }
 
         // Update data-in-code
+        // Apple's dsc_extractor sets dataoff to symoff even when datasize is 0
         if let Some(offset) = self.data_in_code_offset {
             let mut dic = self.data_in_code.unwrap();
             if dic.datasize > 0 {
                 dic.dataoff = new_linkedit_offset + self.new_data_in_code_offset;
             } else {
-                // Zero out dataoff when datasize is 0 to avoid stale cache offsets
-                dic.dataoff = 0;
+                // Point to symbol table location (same as symoff) even when size is 0
+                dic.dataoff = new_linkedit_offset + self.new_symbol_table_offset;
             }
             self.ctx.macho.write_struct(offset, &dic)?;
+        }
+
+        // Zero out chained fixups - the pointers have been rebased via slide info
+        // Apple's dsc_extractor does this to indicate fixups are already applied
+        if let Some(offset) = self.chained_fixups_offset {
+            let mut chained = self.chained_fixups.unwrap();
+            chained.dataoff = 0;
+            chained.datasize = 0;
+            self.ctx.macho.write_struct(offset, &chained)?;
         }
 
         Ok(())
     }
 
     /// Runs the optimization process.
+    ///
+    /// The LINKEDIT layout must match Apple's dsc_extractor order:
+    /// 1. function_starts
+    /// 2. data_in_code (padding to 4-byte alignment for symbol table)
+    /// 3. symbol table (nlist array)
+    /// 4. indirect symbol table
+    /// 5. string table
     fn optimize(mut self) -> Result<Vec<u8>> {
         self.find_load_commands();
 
-        // Copy binding info
-        self.copy_binding_info()?;
-        self.copy_export_info()?;
+        // 1. Copy function starts FIRST (Apple's order)
+        self.copy_function_starts()?;
 
-        // Start symbol table
+        // 2. Copy data in code (may be empty but provides alignment)
+        self.copy_data_in_code()?;
+
+        // Calculate the LINKEDIT base offset in the new file
+        // In the output file, segments are written contiguously starting at offset 0,
+        // so LINKEDIT starts at the sum of all non-LINKEDIT segment filesizes.
+        let linkedit_base: usize = self
+            .ctx
+            .macho
+            .segments()
+            .filter(|s| s.name() != "__LINKEDIT" && s.command.filesize > 0)
+            .map(|s| s.command.filesize as usize)
+            .sum();
+
+        // Align symbol table to 8-byte boundary in absolute file offset
+        // (Apple's dsc_extractor does this)
+        let current_abs_offset = linkedit_base + self.new_linkedit.len();
+        let aligned_abs_offset = (current_abs_offset + 7) & !7;
+        let padding = aligned_abs_offset - current_abs_offset;
+        for _ in 0..padding {
+            self.new_linkedit.push(0);
+        }
+
+        // 3. Symbol table
         self.new_symbol_table_offset = self.new_linkedit.len() as u32;
 
         // Add redacted symbol placeholder if needed
         self.add_redacted_symbol()?;
 
-        // Copy symbols
+        // Copy symbols (order: local, exported, imported)
         self.copy_local_symbols()?;
         self.copy_exported_symbols()?;
         self.copy_imported_symbols()?;
 
-        // Copy other data
-        self.copy_function_starts()?;
-        self.copy_data_in_code()?;
-
-        // Copy indirect symbol table
+        // 4. Copy indirect symbol table
         self.copy_indirect_symbol_table()?;
 
-        // Align before string pool
-        self.align_linkedit();
-
-        // Copy string pool
+        // 5. Copy string pool (no alignment before - C tool puts it immediately after indirect syms)
+        // The string pool itself is already 8-byte padded inside copy_string_pool()
         self.copy_string_pool();
 
-        // Final alignment
-        self.align_linkedit();
+        // No additional alignment - the string pool is already padded
+        // and the file writer handles page alignment
 
-        // Get the new LINKEDIT offset (where it will be written)
-        let linkedit_seg = self.ctx.macho.linkedit_segment().ok_or(Error::Parse {
-            offset: 0,
-            reason: "no LINKEDIT segment".into(),
-        })?;
-        let new_linkedit_offset = linkedit_seg.command.fileoff as u32;
+        // Calculate where LINKEDIT will start in the output file.
+        // In the output file, segments are written contiguously, so LINKEDIT
+        // starts at the sum of all other segment filesizes (which reflect the
+        // new, not cache, sizes).
+        // Note: segment.command.filesize has already been updated by earlier processing
+        // to reflect the data we'll actually write.
+        let new_linkedit_offset: u32 = self
+            .ctx
+            .macho
+            .segments()
+            .filter(|s| s.name() != "__LINKEDIT" && s.command.filesize > 0)
+            .map(|s| s.command.filesize as u32)
+            .sum();
 
-        // Update load commands
+        // Update load commands with absolute offsets
         self.update_load_commands(new_linkedit_offset)?;
 
         self.ctx.info(&format!(
@@ -942,7 +1046,12 @@ impl<'a> LinkeditOptimizer<'a> {
 pub fn optimize_linkedit(ctx: &mut ExtractionContext) -> Result<()> {
     ctx.info("Optimizing LINKEDIT...");
 
-    // Get the current LINKEDIT location
+    // Run the optimizer - this builds the new LINKEDIT content and updates
+    // the segment's fileoff to the new location (sum of other segment filesizes)
+    let optimizer = LinkeditOptimizer::new(ctx);
+    let new_linkedit = optimizer.optimize()?;
+
+    // Get the UPDATED LINKEDIT location (after optimize() updated it)
     let linkedit_offset = {
         let linkedit = ctx.macho.linkedit_segment().ok_or(Error::Parse {
             offset: 0,
@@ -951,20 +1060,18 @@ pub fn optimize_linkedit(ctx: &mut ExtractionContext) -> Result<()> {
         linkedit.command.fileoff as usize
     };
 
-    // Run the optimizer
-    let optimizer = LinkeditOptimizer::new(ctx);
-    let new_linkedit = optimizer.optimize()?;
-
-    // Write the new LINKEDIT to the Mach-O data buffer
-    // First, ensure buffer is large enough
+    // Write the new LINKEDIT content to the buffer at the new offset.
+    // The optimizer has already updated the segment's fileoff to the new location,
+    // so we write the new content there. We DON'T truncate because other segments'
+    // data is at their original cache offsets and we need to preserve that.
     let required_size = linkedit_offset + new_linkedit.len();
     if ctx.macho.data.len() < required_size {
         ctx.macho.data.resize(required_size, 0);
     }
 
-    // Truncate to remove the old large LINKEDIT and write the new one
-    ctx.macho.data.truncate(linkedit_offset);
-    ctx.macho.data.extend_from_slice(&new_linkedit);
+    // Write new LINKEDIT content at the new offset
+    ctx.macho.data[linkedit_offset..linkedit_offset + new_linkedit.len()]
+        .copy_from_slice(&new_linkedit);
 
     Ok(())
 }
