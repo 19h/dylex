@@ -14,7 +14,9 @@ use rayon::prelude::*;
 use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use dylex::{DyldContext, ExtractionOptions, extract_image_with_options};
+use dylex::{
+    DyldContext, ExtractionOptions, extract_image_with_options, extract_images_with_dependencies,
+};
 
 /// Default locations to search for dyld shared caches on macOS.
 const DEFAULT_CACHE_PATHS: &[&str] = &[
@@ -68,6 +70,25 @@ enum Commands {
         /// Number of parallel jobs (default: number of CPUs)
         #[arg(short, long)]
         jobs: Option<usize>,
+
+        /// Extract dependencies (referenced images) along with the target image
+        #[arg(long)]
+        with_deps: bool,
+
+        /// Maximum depth for dependency extraction (default: unlimited)
+        /// Only used with --with-deps
+        #[arg(long)]
+        deps_depth: Option<usize>,
+
+        /// Merge dependencies into a single output binary
+        /// This creates a self-contained dylib with all referenced code/data inlined
+        #[arg(long)]
+        merge_deps: bool,
+
+        /// Maximum depth for dependency merging (default: 1 = direct dependencies only)
+        /// Only used with --merge-deps
+        #[arg(long, default_value = "1")]
+        merge_depth: usize,
 
         /// Path to the dyld shared cache (file or directory).
         /// If not specified, searches default system locations.
@@ -152,6 +173,10 @@ fn main() -> Result<()> {
             preserve_paths,
             verbosity,
             jobs,
+            with_deps,
+            deps_depth,
+            merge_deps,
+            merge_depth,
         } => {
             setup_logging(verbosity);
             cmd_extract(
@@ -163,6 +188,10 @@ fn main() -> Result<()> {
                 preserve_paths,
                 verbosity,
                 jobs,
+                with_deps,
+                deps_depth,
+                merge_deps,
+                merge_depth,
             )
         }
         Commands::List {
@@ -342,6 +371,10 @@ fn cmd_extract(
     preserve_paths: Option<bool>,
     verbosity: u8,
     jobs: Option<usize>,
+    with_deps: bool,
+    deps_depth: Option<usize>,
+    merge_deps: bool,
+    merge_depth: usize,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -356,6 +389,42 @@ fn cmd_extract(
         DyldContext::open(&resolved_path)
             .with_context(|| format!("Failed to open cache: {}", resolved_path.display()))?,
     );
+
+    // Handle merge mode - single image only
+    if merge_deps {
+        let img_name = image.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--merge-deps requires --image to specify the target image")
+        })?;
+
+        let img = cache
+            .find_image(img_name)
+            .with_context(|| format!("Image not found: {}", img_name))?;
+
+        let output_path = output.unwrap_or_else(|| {
+            let basename = img.path.rsplit('/').next().unwrap_or(&img.path);
+            PathBuf::from(format!("{}.merged", basename))
+        });
+
+        info!(
+            "Extracting {} with merged dependencies (depth {}) to {}",
+            img.path,
+            merge_depth,
+            output_path.display()
+        );
+
+        let options = dylex::MergeExtractionOptions {
+            verbosity,
+            max_depth: merge_depth,
+        };
+
+        dylex::extract_image_with_merged_deps(&cache, &img.path, &output_path, options)
+            .with_context(|| format!("Failed to extract with merged deps: {}", img.path))?;
+
+        let elapsed = start.elapsed();
+        info!("Extracted merged binary in {:.2}s", elapsed.as_secs_f64());
+
+        return Ok(());
+    }
 
     // Determine what to extract
     let images_to_extract: Vec<_> = if let Some(ref img_name) = image {
@@ -380,13 +449,83 @@ fn cmd_extract(
         return Ok(());
     }
 
+    // Handle dependency extraction mode
+    if with_deps {
+        // Must output to a directory when extracting with dependencies
+        let output_dir = output.unwrap_or_else(|| PathBuf::from("extracted"));
+
+        info!(
+            "Extracting {} images with dependencies to {}",
+            images_to_extract.len(),
+            output_dir.display()
+        );
+
+        // Configure thread pool
+        if let Some(n) = jobs {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build_global()
+                .ok();
+        }
+
+        let options = ExtractionOptions {
+            verbosity,
+            ..Default::default()
+        };
+
+        // Collect root image paths
+        let root_paths: Vec<String> = images_to_extract
+            .iter()
+            .map(|img| img.path.clone())
+            .collect();
+
+        // Extract with dependencies
+        let result = extract_images_with_dependencies(
+            &cache,
+            &root_paths,
+            &output_dir,
+            options,
+            deps_depth,
+            |current, total, path| {
+                if verbosity >= 2 {
+                    info!("[{}/{}] Extracting: {}", current, total, path);
+                }
+            },
+        );
+
+        match result {
+            Ok(stats) => {
+                let elapsed = start.elapsed();
+                info!(
+                    "Extracted {} images ({} root + {} dependencies) in {:.2}s",
+                    stats.total_extracted,
+                    stats.root_images,
+                    stats.dependencies,
+                    elapsed.as_secs_f64()
+                );
+                if stats.failed > 0 {
+                    warn!("{} images failed to extract", stats.failed);
+                }
+                if stats.skipped > 0 {
+                    info!("{} images skipped (not in cache)", stats.skipped);
+                }
+            }
+            Err(e) => {
+                error!("Extraction failed: {}", e);
+                return Err(e.into());
+            }
+        }
+
+        return Ok(());
+    }
+
     // Determine if we should preserve paths
     let should_preserve = preserve_paths.unwrap_or_else(|| {
         // Default: preserve paths when extracting multiple images
         images_to_extract.len() > 1
     });
 
-    // Single image extraction
+    // Single image extraction (without dependencies)
     if images_to_extract.len() == 1 {
         let img = &images_to_extract[0];
         let output_path =
@@ -419,7 +558,7 @@ fn cmd_extract(
         return Ok(());
     }
 
-    // Multiple image extraction
+    // Multiple image extraction (without dependencies)
     let output_dir = output.unwrap_or_else(|| PathBuf::from("extracted"));
 
     info!(

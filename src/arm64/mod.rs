@@ -64,7 +64,7 @@ pub fn is_bl(instr: u32) -> bool {
 /// Returns true if the instruction is BRAA (authenticated branch).
 #[inline]
 pub fn is_braa(instr: u32) -> bool {
-    (instr & 0xFEFF_FC00) == 0xD71F_0800
+    (instr & 0xFFFF_FC00) == 0xD71F_0800
 }
 
 /// Returns true if the instruction is BRAAZ (authenticated branch, zero modifier).
@@ -281,6 +281,13 @@ mod tests {
 
         let decoded = decode_adrp(instr, pc);
         assert_eq!(decoded, target & !0xFFF);
+    }
+
+    #[test]
+    fn test_is_braa() {
+        let instr = encode_braa(16, 17);
+        assert!(is_braa(instr));
+        assert!(!is_braa(encode_br(16)));
     }
 
     #[test]

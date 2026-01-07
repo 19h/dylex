@@ -4,10 +4,16 @@
 //! directly branching to the resolved target. This module restores the normal
 //! stub format that goes through the lazy symbol pointer, allowing the binary
 //! to work standalone.
+//!
+//! Additionally, in shared caches, auth stubs often reference a "shared region GOT"
+//! that's outside the image. This module rewrites such stubs to use the image's
+//! own `__auth_got` section and populates those GOT entries with resolved values.
 
 use crate::arm64;
+use crate::dyld::SlidePointer5;
 use crate::error::Result;
 use crate::macho::SectionInfo;
+use tracing::debug;
 
 use super::ExtractionContext;
 
@@ -246,6 +252,15 @@ pub fn fix_stubs(ctx: &mut ExtractionContext) -> Result<()> {
             "__auth_got",
             true,
         )?;
+        // Try __AUTH_CONST (newer caches use this segment for auth_got)
+        fixed_count += fix_stub_section(
+            ctx,
+            "__TEXT",
+            "__auth_stubs",
+            "__AUTH_CONST",
+            "__auth_got",
+            true,
+        )?;
     }
 
     if fixed_count > 0 {
@@ -267,24 +282,47 @@ fn fix_stub_section(
     // Get stub section info
     let stubs = match ctx.macho.section(stub_segment, stub_section) {
         Some(s) => s.clone(),
-        None => return Ok(0),
+        None => {
+            debug!("Stub section {}/{} not found", stub_segment, stub_section);
+            return Ok(0);
+        }
     };
 
     let stub_info = match StubSectionInfo::from_section(&stubs) {
         Some(info) => info,
-        None => return Ok(0),
+        None => {
+            debug!(
+                "Could not parse stub section info for {}/{}",
+                stub_segment, stub_section
+            );
+            return Ok(0);
+        }
     };
 
     // Get symbol pointer section info
     let ptrs = match ctx.macho.section(ptr_segment, ptr_section) {
         Some(s) => s.clone(),
-        None => return Ok(0),
+        None => {
+            debug!("Pointer section {}/{} not found", ptr_segment, ptr_section);
+            return Ok(0);
+        }
     };
 
     let ptr_info = match SymbolPointerSectionInfo::from_section(&ptrs) {
         Some(info) => info,
-        None => return Ok(0),
+        None => {
+            debug!(
+                "Could not parse pointer section info for {}/{}",
+                ptr_segment, ptr_section
+            );
+            return Ok(0);
+        }
     };
+
+    debug!(
+        "Processing {} stubs in {}/{} -> {}/{} ({} pointers)",
+        stub_info.count, stub_segment, stub_section, ptr_segment, ptr_section, ptr_info.count
+    );
 
     // Stubs and pointers should have matching indirect symbol indices
     // Each stub corresponds to a lazy symbol pointer
@@ -299,11 +337,16 @@ fn fix_stub_section(
     let mut fixed = 0;
     let expected_stub_size = if is_arm64e { 16 } else { 12 };
 
+    // Get the slide info value_add for decoding pointers
+    // For arm64e caches, this is typically 0x180000000
+    let value_add = ctx.cache.slide_info_value_add().unwrap_or(0x180000000);
+
     // Process each stub
     for i in 0..stub_info.count {
         let stub_offset = stub_info.offset + i * stub_info.stub_size;
         let stub_addr = stub_info.addr + (i * stub_info.stub_size) as u64;
         let ptr_addr = ptr_info.addr + (i * 8) as u64;
+        let ptr_offset = ptr_info.offset + i * 8;
 
         // Read stub bytes
         if stub_offset + stub_info.stub_size > ctx.macho.data.len() {
@@ -313,7 +356,79 @@ fn fix_stub_section(
         let stub_data = &ctx.macho.data[stub_offset..stub_offset + stub_info.stub_size];
         let format = detect_stub_format(stub_data, is_arm64e);
 
-        // Check if stub needs fixing
+        debug!(
+            "Stub {}: format={:?}, addr=0x{:x}, size={}",
+            i, format, stub_addr, stub_info.stub_size
+        );
+
+        // For AuthNormal stubs, check if they reference an external GOT
+        if is_arm64e && format == StubFormat::AuthNormal && stub_data.len() >= 16 {
+            let instr0 =
+                u32::from_le_bytes([stub_data[0], stub_data[1], stub_data[2], stub_data[3]]);
+            let instr1 =
+                u32::from_le_bytes([stub_data[4], stub_data[5], stub_data[6], stub_data[7]]);
+
+            // Decode the GOT address that this stub currently references
+            if let Some(current_got_addr) = arm64::follow_adrp_add(stub_addr, instr0, instr1) {
+                // Check if this address is within our image
+                let is_external = !ctx.macho.contains_addr(current_got_addr);
+
+                if is_external {
+                    // Read the pointer value from the shared region in the cache
+                    if let Ok(ptr_data) = ctx.cache.data_at_addr(current_got_addr, 8) {
+                        let encoded_value = u64::from_le_bytes(ptr_data.try_into().unwrap());
+
+                        if encoded_value != 0 {
+                            // Decode the slide info v5 pointer
+                            let ptr = SlidePointer5(encoded_value);
+                            let decoded_value = if ptr.is_auth() {
+                                ptr.runtime_offset() + value_add
+                            } else {
+                                let runtime_offset = ptr.runtime_offset();
+                                let high8 = (ptr.high8() as u64) << 56;
+                                runtime_offset + value_add + high8
+                            };
+
+                            debug!(
+                                "Stub {} at 0x{:x}: external GOT 0x{:x} -> local GOT 0x{:x}, value 0x{:x} -> 0x{:x}",
+                                i,
+                                stub_addr,
+                                current_got_addr,
+                                ptr_addr,
+                                encoded_value,
+                                decoded_value
+                            );
+
+                            // Write the decoded value to our local GOT
+                            if ptr_offset + 8 <= ctx.macho.data.len() {
+                                ctx.macho.data[ptr_offset..ptr_offset + 8]
+                                    .copy_from_slice(&decoded_value.to_le_bytes());
+                            }
+
+                            // Rewrite the stub to use the local GOT
+                            let new_stub = generate_stub_auth(stub_addr, ptr_addr);
+                            let mut padded = vec![0u8; stub_info.stub_size];
+                            padded[..16].copy_from_slice(&new_stub);
+
+                            // Fill remaining with NOPs
+                            for j in (16..stub_info.stub_size).step_by(4) {
+                                let nop = arm64::encode_nop();
+                                if j + 4 <= stub_info.stub_size {
+                                    padded[j..j + 4].copy_from_slice(&nop.to_le_bytes());
+                                }
+                            }
+
+                            ctx.macho.data[stub_offset..stub_offset + stub_info.stub_size]
+                                .copy_from_slice(&padded);
+                            fixed += 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Check if stub needs fixing (legacy optimized stub handling)
         let needs_fix = match format {
             StubFormat::Optimized => !is_arm64e,
             StubFormat::AuthOptimized => is_arm64e,

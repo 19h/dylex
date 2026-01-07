@@ -104,7 +104,7 @@ pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
         match version {
             2 => process_slide_info_v2(&mut ctx.macho, cache_data, slide_offset, &mapping)?,
             3 => process_slide_info_v3(&mut ctx.macho, cache_data, slide_offset, &mapping)?,
-            5 => process_slide_info_v5(&mut ctx.macho, cache_data, slide_offset, &mapping)?,
+            5 => process_slide_info_v5(&mut ctx.macho, &cache, cache_data, slide_offset, &mapping)?,
             _ => {
                 return Err(Error::UnsupportedSlideVersion(version));
             }
@@ -414,6 +414,7 @@ fn collect_v3_page_writes(
 /// Pages are processed in parallel using rayon.
 fn process_slide_info_v5(
     macho: &mut MachOContext,
+    cache: &Arc<DyldContext>,
     cache_data: &[u8],
     offset: usize,
     mapping: &SlideMapping,
@@ -463,10 +464,11 @@ fn process_slide_info_v5(
         .collect();
 
     // Process pages in parallel
-    let macho_data: &[u8] = &macho.data;
+    // We need the cache (to follow delta chains through other images' regions)
+    // and macho (to write rebased values)
     let all_writes: Vec<Vec<WriteOp>> = page_infos
         .par_iter()
-        .map(|&start_addr| collect_v5_page_writes(macho_data, macho, start_addr, value_add))
+        .map(|&start_addr| collect_v5_page_writes(cache, macho, start_addr, value_add))
         .collect();
 
     // Apply all writes
@@ -480,9 +482,14 @@ fn process_slide_info_v5(
 }
 
 /// Collects write operations for a v5 page without modifying the buffer.
+///
+/// IMPORTANT: We read the delta chain from the cache (which covers all images),
+/// but only generate WriteOps for addresses that are in our macho's segments.
+/// This handles the case where a page contains data from multiple images - we follow
+/// the delta chain through other images' data to find our pointers.
 #[inline]
 fn collect_v5_page_writes(
-    data: &[u8],
+    cache: &Arc<DyldContext>,
     macho: &MachOContext,
     mut addr: u64,
     value_add: u64,
@@ -490,46 +497,38 @@ fn collect_v5_page_writes(
     let mut writes = Vec::with_capacity(64);
 
     loop {
-        let macho_offset = match macho.addr_to_offset(addr) {
-            Some(off) => off,
-            None => {
-                trace!("Address {:#x} not in Mach-O, skipping", addr);
+        // First check if this address is in our macho
+        let macho_offset = macho.addr_to_offset(addr);
+
+        // Read the raw value from the cache to follow the delta chain
+        // This works even for addresses not in our macho (other images' data)
+        let raw_value = match cache.data_at_addr(addr, 8) {
+            Ok(data) => u64::from_le_bytes(data.try_into().unwrap()),
+            Err(_) => {
                 break;
             }
         };
 
-        if macho_offset + 8 > data.len() {
-            break;
-        }
-
-        let raw_value = u64::from_le_bytes([
-            data[macho_offset],
-            data[macho_offset + 1],
-            data[macho_offset + 2],
-            data[macho_offset + 3],
-            data[macho_offset + 4],
-            data[macho_offset + 5],
-            data[macho_offset + 6],
-            data[macho_offset + 7],
-        ]);
-
         let ptr = SlidePointer5(raw_value);
         let delta = ptr.next() * 8;
 
-        let new_value = if ptr.is_auth() {
-            // Authenticated pointer
-            ptr.runtime_offset() + value_add
-        } else {
-            // Regular pointer with high8
-            let runtime_offset = ptr.runtime_offset();
-            let high8 = (ptr.high8() as u64) << 56;
-            runtime_offset + value_add + high8
-        };
+        // Only write if this address is in our macho
+        if let Some(macho_off) = macho_offset {
+            let new_value = if ptr.is_auth() {
+                // Authenticated pointer
+                ptr.runtime_offset() + value_add
+            } else {
+                // Regular pointer with high8
+                let runtime_offset = ptr.runtime_offset();
+                let high8 = (ptr.high8() as u64) << 56;
+                runtime_offset + value_add + high8
+            };
 
-        writes.push(WriteOp {
-            offset: macho_offset,
-            value: new_value,
-        });
+            writes.push(WriteOp {
+                offset: macho_off,
+                value: new_value,
+            });
+        }
 
         if delta == 0 {
             break;
@@ -539,5 +538,3 @@ fn collect_v5_page_writes(
 
     writes
 }
-
-// Note: rebase_v5_page removed - replaced by parallel collect_v5_page_writes

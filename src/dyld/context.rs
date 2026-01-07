@@ -787,6 +787,88 @@ impl DyldContext {
             reason: "invalid UTF-8 string in symbols cache".into(),
         })
     }
+
+    /// Returns the slide info value_add for the cache.
+    ///
+    /// This is the base address that needs to be added to rebased pointers.
+    /// For arm64e caches, this is typically the shared region start (0x180000000).
+    pub fn slide_info_value_add(&self) -> Option<u64> {
+        // Find the first mapping with slide info
+        for mapping in &self.mappings {
+            if !mapping.has_slide_info() {
+                continue;
+            }
+
+            // Read the slide info header to get the version
+            let cache_data = self.data_for_subcache(mapping.subcache_index);
+            let offset = mapping.slide_info_offset as usize;
+
+            if offset + 4 > cache_data.len() {
+                continue;
+            }
+
+            let version = u32::from_le_bytes([
+                cache_data[offset],
+                cache_data[offset + 1],
+                cache_data[offset + 2],
+                cache_data[offset + 3],
+            ]);
+
+            match version {
+                2 => {
+                    // Slide info v2 has value_add at offset 32
+                    if offset + 40 <= cache_data.len() {
+                        let value_add = u64::from_le_bytes([
+                            cache_data[offset + 32],
+                            cache_data[offset + 33],
+                            cache_data[offset + 34],
+                            cache_data[offset + 35],
+                            cache_data[offset + 36],
+                            cache_data[offset + 37],
+                            cache_data[offset + 38],
+                            cache_data[offset + 39],
+                        ]);
+                        return Some(value_add);
+                    }
+                }
+                3 => {
+                    // Slide info v3 has auth_value_add at offset 8
+                    if offset + 16 <= cache_data.len() {
+                        let value_add = u64::from_le_bytes([
+                            cache_data[offset + 8],
+                            cache_data[offset + 9],
+                            cache_data[offset + 10],
+                            cache_data[offset + 11],
+                            cache_data[offset + 12],
+                            cache_data[offset + 13],
+                            cache_data[offset + 14],
+                            cache_data[offset + 15],
+                        ]);
+                        return Some(value_add);
+                    }
+                }
+                5 => {
+                    // Slide info v5 has value_add at offset 8
+                    if offset + 16 <= cache_data.len() {
+                        let value_add = u64::from_le_bytes([
+                            cache_data[offset + 8],
+                            cache_data[offset + 9],
+                            cache_data[offset + 10],
+                            cache_data[offset + 11],
+                            cache_data[offset + 12],
+                            cache_data[offset + 13],
+                            cache_data[offset + 14],
+                            cache_data[offset + 15],
+                        ]);
+                        return Some(value_add);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]

@@ -584,6 +584,26 @@ impl MachOContext {
         })
     }
 
+    /// Returns a list of all dependency paths (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, etc.)
+    /// excluding LC_ID_DYLIB (which identifies the image itself).
+    pub fn dependencies(&self) -> Vec<String> {
+        self.load_commands
+            .iter()
+            .filter_map(|lc| {
+                if let LoadCommandInfo::Dylib { command, name, .. } = lc {
+                    // Include all dylib load commands except LC_ID_DYLIB
+                    match command.cmd {
+                        LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB
+                        | LC_LAZY_LOAD_DYLIB | LC_LOAD_UPWARD_DYLIB => Some(name.clone()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Returns true if this is an ARM64 binary.
     pub fn is_arm64(&self) -> bool {
         self.header.is_arm64()
