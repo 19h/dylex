@@ -96,9 +96,6 @@ struct LinkeditOptimizer<'a> {
     /// Number of symbols added so far
     symbol_count: u32,
 
-    /// Number of redacted symbols found
-    redacted_symbol_count: u32,
-
     // Load command references (offsets and data)
     symtab_offset: Option<usize>,
     symtab: Option<SymtabCommand>,
@@ -153,7 +150,6 @@ impl<'a> LinkeditOptimizer<'a> {
                 Default::default(),
             ),
             symbol_count: 0,
-            redacted_symbol_count: 0,
             symtab_offset: None,
             symtab: None,
             dysymtab_offset: None,
@@ -326,55 +322,6 @@ impl<'a> LinkeditOptimizer<'a> {
                 self.new_export_offset = self.new_linkedit.len() as u32;
                 self.new_linkedit.extend_from_slice(&data);
             }
-        }
-
-        Ok(())
-    }
-
-    /// Counts redacted indirect symbols and adds a placeholder entry.
-    fn add_redacted_symbol(&mut self) -> Result<()> {
-        let Some(dysymtab) = self.dysymtab else {
-            return Ok(());
-        };
-
-        if dysymtab.nindirectsyms == 0 {
-            return Ok(());
-        }
-
-        // Count indirect symbols that point to index 0 (redacted)
-        let indirect_start = dysymtab.indirectsymoff as usize;
-        let indirect_count = dysymtab.nindirectsyms as usize;
-
-        for i in 0..indirect_count {
-            let offset = indirect_start + i * 4;
-            if offset + 4 > self.ctx.macho.data.len() {
-                break;
-            }
-
-            let sym_index = u32::from_le_bytes([
-                self.ctx.macho.data[offset],
-                self.ctx.macho.data[offset + 1],
-                self.ctx.macho.data[offset + 2],
-                self.ctx.macho.data[offset + 3],
-            ]);
-
-            if sym_index == 0 {
-                self.redacted_symbol_count += 1;
-            }
-        }
-
-        // If we found redacted symbols, add a placeholder entry
-        if self.redacted_symbol_count > 0 {
-            let str_index = self.string_pool.add(b"<redacted>");
-
-            let mut nlist = Nlist64::default();
-            nlist.n_strx = str_index;
-            nlist.n_type = 1; // N_EXT
-
-            self.new_linkedit.extend_from_slice(nlist.as_bytes());
-            self.symbol_count += 1;
-
-            self.ctx.has_redacted_indirect = true;
         }
 
         Ok(())
@@ -708,13 +655,6 @@ impl<'a> LinkeditOptimizer<'a> {
             self.new_undef_sym_count += 1;
         }
 
-        // Reserve space for redacted symbols that might be fixed later
-        if self.redacted_symbol_count > 0 {
-            let padding = self.redacted_symbol_count as usize * Nlist64::SIZE;
-            self.new_linkedit
-                .resize(self.new_linkedit.len() + padding, 0);
-        }
-
         Ok(())
     }
 
@@ -798,7 +738,7 @@ impl<'a> LinkeditOptimizer<'a> {
                 self.ctx.macho.data[offset + 3],
             ]);
 
-            // Check for special values
+            // Check for special marker values (these have high bits set)
             if sym_index == INDIRECT_SYMBOL_ABS
                 || sym_index == INDIRECT_SYMBOL_LOCAL
                 || sym_index == (INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL)
@@ -808,12 +748,8 @@ impl<'a> LinkeditOptimizer<'a> {
                 continue;
             }
 
-            // Handle redacted (index 0) entries
-            if sym_index == 0 {
-                // Point to the redacted placeholder symbol (index 0 in our new table)
-                self.new_linkedit.extend_from_slice(&0u32.to_le_bytes());
-                continue;
-            }
+            // NOTE: Index 0 is a valid symbol index (the first symbol in the table).
+            // The previous implementation incorrectly treated index 0 as "redacted".
 
             // Remap the symbol index
             if let Some(&new_index) = self.old_to_new_symbol_index.get(&sym_index) {
@@ -1012,8 +948,11 @@ impl<'a> LinkeditOptimizer<'a> {
         // 3. Symbol table
         self.new_symbol_table_offset = self.new_linkedit.len() as u32;
 
-        // Add redacted symbol placeholder if needed
-        self.add_redacted_symbol()?;
+        // NOTE: We do NOT add a "<redacted>" placeholder symbol here.
+        // The previous implementation incorrectly assumed that indirect symbols
+        // pointing to index 0 were "redacted", but index 0 is just the first
+        // valid symbol in the symbol table. Apple's dsc_extractor does not add
+        // any placeholder symbols.
 
         // Copy symbols (order: local, exported, imported)
         self.copy_local_symbols()?;
