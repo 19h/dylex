@@ -44,17 +44,21 @@ pub struct ImageSegmentMapping {
 }
 
 impl ImageSegmentMapping {
-    /// Checks if an address falls within this image's original range.
+    /// Checks if an address falls within this image's original segment ranges.
     pub fn contains_original(&self, addr: u64) -> bool {
-        addr >= self.original_base && addr < self.original_base + self.size
+        self.segments
+            .values()
+            .any(|(orig, _merged, size)| addr >= *orig && addr < *orig + *size)
     }
 
     /// Translates an original address to the merged address.
     pub fn translate(&self, addr: u64) -> Option<u64> {
-        if !self.contains_original(addr) {
-            return None;
+        for (orig, merged, size) in self.segments.values() {
+            if addr >= *orig && addr < *orig + *size {
+                return Some(merged + (addr - *orig));
+            }
         }
-        Some(addr - self.original_base + self.merged_base)
+        None
     }
 }
 
