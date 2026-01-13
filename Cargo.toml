@@ -54,6 +54,9 @@ bitflags = "2"
 indexmap = "2"
 rustc-hash = "2"
 
+# Performance optimizations
+memchr = "2"              # SIMD-accelerated byte search
+
 [dev-dependencies]
 tempfile = "3"
 pretty_assertions = "1"

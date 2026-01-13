@@ -43,14 +43,20 @@ pub enum StubFormat {
 }
 
 /// Detects the stub format from instruction bytes.
+///
+/// # Performance
+///
+/// Uses optimized u32 reads that compile to single unaligned load instructions.
+#[inline]
 pub fn detect_stub_format(data: &[u8], is_arm64e: bool) -> StubFormat {
     if data.len() < 12 {
         return StubFormat::Unknown;
     }
 
-    let instr0 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let instr1 = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    let instr2 = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    // Optimized: single unaligned loads
+    let instr0 = crate::util::read_u32_le(&data[0..]);
+    let instr1 = crate::util::read_u32_le(&data[4..]);
+    let instr2 = crate::util::read_u32_le(&data[8..]);
 
     // Simple branch
     if arm64::is_branch(instr0) {
@@ -74,7 +80,7 @@ pub fn detect_stub_format(data: &[u8], is_arm64e: bool) -> StubFormat {
 
     // ARM64e formats need 16 bytes
     if is_arm64e && data.len() >= 16 {
-        let instr3 = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let instr3 = crate::util::read_u32_le(&data[12..]);
 
         // ADRP + ADD + LDR + BRAA (auth normal)
         if arm64::is_add_imm(instr1) && arm64::is_ldr_unsigned_imm(instr2) && arm64::is_braa(instr3)

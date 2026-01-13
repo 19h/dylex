@@ -89,12 +89,8 @@ pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
         return Ok(());
     }
 
-    let flags = u32::from_le_bytes([
-        ctx.macho.data[offset + 4],
-        ctx.macho.data[offset + 5],
-        ctx.macho.data[offset + 6],
-        ctx.macho.data[offset + 7],
-    ]);
+    // Optimized: single unaligned load
+    let flags = crate::util::read_u32_le(&ctx.macho.data[offset + 4..]);
 
     if (flags & OBJC_IMAGE_OPTIMIZED_BY_DYLD) == 0 {
         ctx.info("ObjC not optimized by dyld, skipping");
@@ -142,17 +138,8 @@ fn fix_class_method_lists(ctx: &mut ExtractionContext) -> Result<usize> {
             break;
         }
 
-        // Read class pointer
-        let class_addr = u64::from_le_bytes([
-            ctx.macho.data[ptr_offset],
-            ctx.macho.data[ptr_offset + 1],
-            ctx.macho.data[ptr_offset + 2],
-            ctx.macho.data[ptr_offset + 3],
-            ctx.macho.data[ptr_offset + 4],
-            ctx.macho.data[ptr_offset + 5],
-            ctx.macho.data[ptr_offset + 6],
-            ctx.macho.data[ptr_offset + 7],
-        ]);
+        // Read class pointer (optimized: single unaligned load)
+        let class_addr = crate::util::read_u64_le(&ctx.macho.data[ptr_offset..]);
 
         // Unmask pointer (clear top byte for arm64e)
         let class_addr = class_addr & 0x0000_FFFF_FFFF_FFFF;
@@ -178,17 +165,8 @@ fn fix_class_at(ctx: &mut ExtractionContext, class_offset: usize) -> Result<usiz
         return Ok(0);
     }
 
-    // Read data pointer (at offset 32 in the class)
-    let data_addr = u64::from_le_bytes([
-        ctx.macho.data[class_offset + 32],
-        ctx.macho.data[class_offset + 33],
-        ctx.macho.data[class_offset + 34],
-        ctx.macho.data[class_offset + 35],
-        ctx.macho.data[class_offset + 36],
-        ctx.macho.data[class_offset + 37],
-        ctx.macho.data[class_offset + 38],
-        ctx.macho.data[class_offset + 39],
-    ]);
+    // Read data pointer (at offset 32 in the class, optimized load)
+    let data_addr = crate::util::read_u64_le(&ctx.macho.data[class_offset + 32..]);
 
     // Unmask and check low bits
     let data_addr = data_addr & 0x0000_FFFF_FFFF_FFF8; // Clear low 3 bits and top byte
@@ -219,17 +197,8 @@ fn fix_class_ro(ctx: &mut ExtractionContext, ro_offset: usize) -> Result<usize> 
         return Ok(0);
     }
 
-    // Read baseMethods pointer
-    let methods_addr = u64::from_le_bytes([
-        ctx.macho.data[ro_offset + 32],
-        ctx.macho.data[ro_offset + 33],
-        ctx.macho.data[ro_offset + 34],
-        ctx.macho.data[ro_offset + 35],
-        ctx.macho.data[ro_offset + 36],
-        ctx.macho.data[ro_offset + 37],
-        ctx.macho.data[ro_offset + 38],
-        ctx.macho.data[ro_offset + 39],
-    ]);
+    // Read baseMethods pointer (optimized load)
+    let methods_addr = crate::util::read_u64_le(&ctx.macho.data[ro_offset + 32..]);
 
     if methods_addr == 0 {
         return Ok(0);
@@ -266,17 +235,8 @@ fn fix_category_method_lists(ctx: &mut ExtractionContext) -> Result<usize> {
             break;
         }
 
-        // Read category pointer
-        let cat_addr = u64::from_le_bytes([
-            ctx.macho.data[ptr_offset],
-            ctx.macho.data[ptr_offset + 1],
-            ctx.macho.data[ptr_offset + 2],
-            ctx.macho.data[ptr_offset + 3],
-            ctx.macho.data[ptr_offset + 4],
-            ctx.macho.data[ptr_offset + 5],
-            ctx.macho.data[ptr_offset + 6],
-            ctx.macho.data[ptr_offset + 7],
-        ]);
+        // Read category pointer (optimized load)
+        let cat_addr = crate::util::read_u64_le(&ctx.macho.data[ptr_offset..]);
 
         let cat_addr = cat_addr & 0x0000_FFFF_FFFF_FFFF;
 
@@ -304,17 +264,8 @@ fn fix_category_at(ctx: &mut ExtractionContext, cat_offset: usize) -> Result<usi
 
     let mut fixed = 0;
 
-    // Fix instance methods
-    let instance_methods = u64::from_le_bytes([
-        ctx.macho.data[cat_offset + 16],
-        ctx.macho.data[cat_offset + 17],
-        ctx.macho.data[cat_offset + 18],
-        ctx.macho.data[cat_offset + 19],
-        ctx.macho.data[cat_offset + 20],
-        ctx.macho.data[cat_offset + 21],
-        ctx.macho.data[cat_offset + 22],
-        ctx.macho.data[cat_offset + 23],
-    ]);
+    // Fix instance methods (optimized load)
+    let instance_methods = crate::util::read_u64_le(&ctx.macho.data[cat_offset + 16..]);
 
     if instance_methods != 0 {
         let addr = instance_methods & 0x0000_FFFF_FFFF_FFFF;
@@ -323,17 +274,8 @@ fn fix_category_at(ctx: &mut ExtractionContext, cat_offset: usize) -> Result<usi
         }
     }
 
-    // Fix class methods
-    let class_methods = u64::from_le_bytes([
-        ctx.macho.data[cat_offset + 24],
-        ctx.macho.data[cat_offset + 25],
-        ctx.macho.data[cat_offset + 26],
-        ctx.macho.data[cat_offset + 27],
-        ctx.macho.data[cat_offset + 28],
-        ctx.macho.data[cat_offset + 29],
-        ctx.macho.data[cat_offset + 30],
-        ctx.macho.data[cat_offset + 31],
-    ]);
+    // Fix class methods (optimized load)
+    let class_methods = crate::util::read_u64_le(&ctx.macho.data[cat_offset + 24..]);
 
     if class_methods != 0 {
         let addr = class_methods & 0x0000_FFFF_FFFF_FFFF;
@@ -358,13 +300,8 @@ fn fix_method_list(ctx: &mut ExtractionContext, offset: usize) -> Result<usize> 
         return Ok(0);
     }
 
-    // Read entsize_and_flags
-    let entsize_and_flags = u32::from_le_bytes([
-        ctx.macho.data[offset],
-        ctx.macho.data[offset + 1],
-        ctx.macho.data[offset + 2],
-        ctx.macho.data[offset + 3],
-    ]);
+    // Read entsize_and_flags (optimized load)
+    let entsize_and_flags = crate::util::read_u32_le(&ctx.macho.data[offset..]);
 
     // Check if method list has optimization flags that need clearing
     let has_direct_sel = (entsize_and_flags & METHOD_LIST_DIRECT_SEL_FLAG) != 0;

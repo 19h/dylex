@@ -40,6 +40,7 @@ pub mod converter;
 pub mod dyld;
 pub mod error;
 pub mod macho;
+pub mod util;
 
 // Re-export main types
 pub use dyld::{DyldContext, ImageEntry, MappingEntry};

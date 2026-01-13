@@ -585,6 +585,10 @@ impl DyldContext {
     }
 
     /// Reads a null-terminated string from the cache.
+    ///
+    /// # Performance
+    ///
+    /// Uses SIMD-accelerated null byte search (memchr).
     pub fn read_string(&self, offset: usize) -> Result<String> {
         if offset >= self.mmap.len() {
             return Err(Error::Parse {
@@ -594,7 +598,7 @@ impl DyldContext {
         }
 
         let bytes = &self.mmap[offset..];
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let end = crate::util::memchr_null(bytes);
         String::from_utf8(bytes[..end].to_vec()).map_err(|_| Error::Parse {
             offset,
             reason: "invalid UTF-8 string".into(),
@@ -767,6 +771,10 @@ impl DyldContext {
     }
 
     /// Reads a null-terminated string from the symbols cache.
+    ///
+    /// # Performance
+    ///
+    /// Uses SIMD-accelerated null byte search (memchr).
     pub fn read_symbols_string(&self, offset: usize) -> Result<String> {
         let data = self.symbols_cache_data().ok_or(Error::Parse {
             offset: 0,
@@ -781,7 +789,7 @@ impl DyldContext {
         }
 
         let bytes = &data[offset..];
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let end = crate::util::memchr_null(bytes);
         String::from_utf8(bytes[..end].to_vec()).map_err(|_| Error::Parse {
             offset,
             reason: "invalid UTF-8 string in symbols cache".into(),
@@ -807,60 +815,25 @@ impl DyldContext {
                 continue;
             }
 
-            let version = u32::from_le_bytes([
-                cache_data[offset],
-                cache_data[offset + 1],
-                cache_data[offset + 2],
-                cache_data[offset + 3],
-            ]);
+            let version = crate::util::read_u32_le(&cache_data[offset..]);
 
             match version {
                 2 => {
                     // Slide info v2 has value_add at offset 32
                     if offset + 40 <= cache_data.len() {
-                        let value_add = u64::from_le_bytes([
-                            cache_data[offset + 32],
-                            cache_data[offset + 33],
-                            cache_data[offset + 34],
-                            cache_data[offset + 35],
-                            cache_data[offset + 36],
-                            cache_data[offset + 37],
-                            cache_data[offset + 38],
-                            cache_data[offset + 39],
-                        ]);
-                        return Some(value_add);
+                        return Some(crate::util::read_u64_le(&cache_data[offset + 32..]));
                     }
                 }
                 3 => {
                     // Slide info v3 has auth_value_add at offset 8
                     if offset + 16 <= cache_data.len() {
-                        let value_add = u64::from_le_bytes([
-                            cache_data[offset + 8],
-                            cache_data[offset + 9],
-                            cache_data[offset + 10],
-                            cache_data[offset + 11],
-                            cache_data[offset + 12],
-                            cache_data[offset + 13],
-                            cache_data[offset + 14],
-                            cache_data[offset + 15],
-                        ]);
-                        return Some(value_add);
+                        return Some(crate::util::read_u64_le(&cache_data[offset + 8..]));
                     }
                 }
                 5 => {
                     // Slide info v5 has value_add at offset 8
                     if offset + 16 <= cache_data.len() {
-                        let value_add = u64::from_le_bytes([
-                            cache_data[offset + 8],
-                            cache_data[offset + 9],
-                            cache_data[offset + 10],
-                            cache_data[offset + 11],
-                            cache_data[offset + 12],
-                            cache_data[offset + 13],
-                            cache_data[offset + 14],
-                            cache_data[offset + 15],
-                        ]);
-                        return Some(value_add);
+                        return Some(crate::util::read_u64_le(&cache_data[offset + 8..]));
                     }
                 }
                 _ => {}

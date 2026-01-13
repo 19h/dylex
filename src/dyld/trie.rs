@@ -39,54 +39,25 @@ pub const EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER: u64 = 0x10;
 /// Reads an unsigned LEB128 value from the given slice.
 ///
 /// Returns the decoded value and the number of bytes consumed.
-#[inline]
+///
+/// # Performance
+///
+/// Uses a fast path for 1-2 byte values which covers >95% of real-world cases.
+/// Falls back to a loop only for larger values.
+#[inline(always)]
 pub fn read_uleb128(data: &[u8]) -> Result<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut shift = 0u32;
-    let mut count = 0usize;
-
-    for &byte in data {
-        count += 1;
-        let value = (byte & 0x7F) as u64;
-
-        // Check for overflow
-        if shift >= 64 || (shift == 63 && value > 1) {
-            return Err(Error::InvalidUleb128 { offset: 0 });
-        }
-
-        result |= value << shift;
-        shift += 7;
-
-        if (byte & 0x80) == 0 {
-            return Ok((result, count));
-        }
-    }
-
-    Err(Error::InvalidUleb128 { offset: 0 })
+    // Fast path: use the optimized implementation from util
+    crate::util::read_uleb128_fast(data).ok_or(Error::InvalidUleb128 { offset: 0 })
 }
 
 /// Reads a signed LEB128 value from the given slice.
-#[inline]
+///
+/// # Performance
+///
+/// Uses a fast path for common small values.
+#[inline(always)]
 pub fn read_sleb128(data: &[u8]) -> Result<(i64, usize)> {
-    let mut result: i64 = 0;
-    let mut shift = 0u32;
-    let mut count = 0usize;
-
-    for &byte in data {
-        count += 1;
-        result |= ((byte & 0x7F) as i64) << shift;
-        shift += 7;
-
-        if (byte & 0x80) == 0 {
-            // Sign extend if needed
-            if shift < 64 && (byte & 0x40) != 0 {
-                result |= !0i64 << shift;
-            }
-            return Ok((result, count));
-        }
-    }
-
-    Err(Error::InvalidUleb128 { offset: 0 })
+    crate::util::read_sleb128_fast(data).ok_or(Error::InvalidUleb128 { offset: 0 })
 }
 
 /// Writes an unsigned LEB128 value to a buffer.

@@ -225,22 +225,13 @@ fn get_image_address_range(cache: &DyldContext, image_path: &str) -> Result<(u64
         if offset + 8 > header_and_cmds.len() {
             break;
         }
-        let cmd = u32::from_le_bytes(header_and_cmds[offset..offset + 4].try_into().unwrap());
-        let cmdsize =
-            u32::from_le_bytes(header_and_cmds[offset + 4..offset + 8].try_into().unwrap())
-                as usize;
+        // Optimized: single unaligned loads
+        let cmd = crate::util::read_u32_le(&header_and_cmds[offset..]);
+        let cmdsize = crate::util::read_u32_le(&header_and_cmds[offset + 4..]) as usize;
 
         if cmd == LC_SEGMENT_64 && offset + SegmentCommand64::SIZE <= header_and_cmds.len() {
-            let vmaddr = u64::from_le_bytes(
-                header_and_cmds[offset + 24..offset + 32]
-                    .try_into()
-                    .unwrap(),
-            );
-            let vmsize = u64::from_le_bytes(
-                header_and_cmds[offset + 32..offset + 40]
-                    .try_into()
-                    .unwrap(),
-            );
+            let vmaddr = crate::util::read_u64_le(&header_and_cmds[offset + 24..]);
+            let vmsize = crate::util::read_u64_le(&header_and_cmds[offset + 32..]);
 
             if vmsize > 0 {
                 min_addr = min_addr.min(vmaddr);
@@ -381,6 +372,11 @@ fn scan_image_pointers(
 }
 
 /// Scans a section's data for pointer values and adds referenced images to the set.
+///
+/// # Performance
+///
+/// Uses optimized u64 reads that compile to single unaligned load instructions.
+/// The inner loop is kept simple for LLVM auto-vectorization.
 fn scan_section_pointers(
     data: &[u8],
     sect: &Section64,
@@ -389,29 +385,21 @@ fn scan_section_pointers(
 ) {
     let sect_name = sect.name();
 
-    // Determine pointer stride based on section type
-    let stride = if sect_name.contains("stub") {
-        // Stubs have code, not raw pointers - skip
+    // Stubs have code, not raw pointers - skip
+    if sect_name.contains("stub") {
         return;
-    } else {
-        8 // 64-bit pointers
-    };
+    }
 
-    // Scan through section data
-    for i in (0..data.len()).step_by(stride) {
-        if i + 8 > data.len() {
-            break;
-        }
-
-        let ptr_value = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
-
-        // Skip null pointers and obviously invalid values
-        if ptr_value == 0 || ptr_value < 0x100000000 {
-            continue;
-        }
-
+    // Use optimized pointer scanning from util module
+    // This uses fast u64 reads and early-exit for null/small values
+    for (_offset, ptr_value) in crate::util::scan_pointers_in_range(
+        data,
+        8, // 64-bit pointer stride
+        crate::util::MIN_VALID_POINTER,
+        u64::MAX,
+    ) {
         // Strip pointer authentication bits (top byte on arm64e)
-        let clean_ptr = ptr_value & 0x0000_FFFF_FFFF_FFFF;
+        let clean_ptr = ptr_value & crate::util::ADDR_MASK_48BIT;
 
         // Find which image this pointer references
         if let Some(target_path) = find_image_for_address(clean_ptr, ranges) {
@@ -1326,11 +1314,23 @@ pub fn fix_merged_stubs(ctx: &mut MergeContext) -> Result<()> {
 ///
 /// This uses section-level analysis to only scan sections known to contain pointers,
 /// avoiding false positives from non-pointer data that happens to look like addresses.
+/// Fixes all pointers in the merged image to point to merged locations.
+///
+/// This uses section-level analysis to only scan sections known to contain pointers,
+/// avoiding false positives from non-pointer data that happens to look like addresses.
+///
+/// # Performance
+///
+/// Uses optimized u64 reads/writes that compile to single unaligned load/store
+/// instructions. The inner loop is kept simple for LLVM auto-vectorization potential.
 pub fn fix_merged_pointers(ctx: &mut MergeContext) -> Result<()> {
+    use byteorder::{ByteOrder, LittleEndian};
+
     // Parse sections that contain pointers
     let sections = parse_sections(&ctx.data)?;
 
     let mut fixed_count = 0u64;
+    let addr_mask = crate::util::ADDR_MASK_48BIT;
 
     for section in &sections {
         if section.name.ends_with(",__auth_got") {
@@ -1344,25 +1344,19 @@ pub fn fix_merged_pointers(ctx: &mut MergeContext) -> Result<()> {
             continue;
         }
 
-        // Scan for pointers (8-byte aligned)
-        for offset in (start..end).step_by(8) {
-            if offset + 8 > ctx.data.len() {
-                break;
-            }
+        // Scan for pointers (8-byte aligned) with optimized reads
+        let mut offset = start;
+        while offset + 8 <= end.min(ctx.data.len()) {
+            // Optimized: single unaligned load
+            let raw_value = crate::util::read_u64_le(&ctx.data[offset..]);
 
-            let raw_value = u64::from_le_bytes(ctx.data[offset..offset + 8].try_into().unwrap());
-
-            // Skip null pointers
+            // Skip null pointers (fast path)
             if raw_value == 0 {
+                offset += 8;
                 continue;
             }
 
             let ptr_addr = section.addr + (offset - start) as u64;
-
-            // Handle tagged/authenticated pointers:
-            // High bits may contain type info or PAC signatures
-            // Mask to get the address portion (lower 48 bits typically)
-            let addr_mask = 0x0000_FFFF_FFFF_FFFF_u64;
             let raw_addr = raw_value & addr_mask;
 
             let needs_decode =
@@ -1377,23 +1371,22 @@ pub fn fix_merged_pointers(ctx: &mut MergeContext) -> Result<()> {
             let addr_value = decoded_value & addr_mask;
 
             // Skip if address portion is zero
-            if addr_value == 0 {
-                continue;
+            if addr_value != 0 {
+                let new_addr = if let Some(translated) = ctx.translate_addr(addr_value) {
+                    translated
+                } else {
+                    addr_value
+                };
+
+                let new_value = high_bits | new_addr;
+                if new_value != raw_value {
+                    // Optimized: single unaligned store
+                    LittleEndian::write_u64(&mut ctx.data[offset..], new_value);
+                    fixed_count += 1;
+                }
             }
 
-            let new_addr = if let Some(translated) = ctx.translate_addr(addr_value) {
-                translated
-            } else if ctx.is_in_shared_region(addr_value) {
-                addr_value
-            } else {
-                addr_value
-            };
-
-            let new_value = high_bits | new_addr;
-            if new_value != raw_value {
-                ctx.data[offset..offset + 8].copy_from_slice(&new_value.to_le_bytes());
-                fixed_count += 1;
-            }
+            offset += 8;
         }
     }
 

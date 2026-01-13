@@ -731,12 +731,8 @@ impl<'a> LinkeditOptimizer<'a> {
                 continue;
             }
 
-            let sym_index = u32::from_le_bytes([
-                self.ctx.macho.data[offset],
-                self.ctx.macho.data[offset + 1],
-                self.ctx.macho.data[offset + 2],
-                self.ctx.macho.data[offset + 3],
-            ]);
+            // Optimized: single unaligned load
+            let sym_index = crate::util::read_u32_le(&self.ctx.macho.data[offset..]);
 
             // Check for special marker values (these have high bits set)
             if sym_index == INDIRECT_SYMBOL_ABS
@@ -1001,10 +997,10 @@ impl<'a> LinkeditOptimizer<'a> {
 // =============================================================================
 
 /// Fast null byte search.
-/// This uses iterator which LLVM can vectorize on release builds.
-#[inline]
+/// Uses the memchr crate for SIMD-accelerated search (AVX2/NEON).
+#[inline(always)]
 fn memchr_null(data: &[u8]) -> usize {
-    data.iter().position(|&b| b == 0).unwrap_or(data.len())
+    crate::util::memchr_null(data)
 }
 
 // =============================================================================

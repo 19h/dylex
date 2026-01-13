@@ -88,13 +88,8 @@ pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
             continue;
         }
 
-        // Read version
-        let version = u32::from_le_bytes([
-            cache_data[slide_offset],
-            cache_data[slide_offset + 1],
-            cache_data[slide_offset + 2],
-            cache_data[slide_offset + 3],
-        ]);
+        // Read version (optimized: single unaligned load)
+        let version = crate::util::read_u32_le(&cache_data[slide_offset..]);
 
         debug!(
             "Processing slide info v{} for mapping at {:#x}",
@@ -163,16 +158,14 @@ fn process_slide_info_v2(
     );
 
     // Collect page info for parallel processing
+    // Uses optimized u16 reads for better performance
     let page_infos: Vec<_> = (0..page_count)
         .filter_map(|page_idx| {
             let page_start_offset = page_starts_offset + page_idx * 2;
             if page_start_offset + 2 > cache_data.len() {
                 return None;
             }
-            let page_start = u16::from_le_bytes([
-                cache_data[page_start_offset],
-                cache_data[page_start_offset + 1],
-            ]);
+            let page_start = crate::util::read_u16_le(&cache_data[page_start_offset..]);
 
             // Skip pages with no rebasing needed
             if page_start == (DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE & 0xFFFF) as u16 {
@@ -213,6 +206,10 @@ fn process_slide_info_v2(
 }
 
 /// Collects write operations for a v2 page without modifying the buffer.
+///
+/// # Performance
+///
+/// Uses optimized u64 reads that compile to single unaligned load instructions.
 #[inline]
 fn collect_v2_page_writes(
     data: &[u8],
@@ -238,16 +235,8 @@ fn collect_v2_page_writes(
             break;
         }
 
-        let raw_value = u64::from_le_bytes([
-            data[macho_offset],
-            data[macho_offset + 1],
-            data[macho_offset + 2],
-            data[macho_offset + 3],
-            data[macho_offset + 4],
-            data[macho_offset + 5],
-            data[macho_offset + 6],
-            data[macho_offset + 7],
-        ]);
+        // Optimized: single unaligned load instead of byte-by-byte
+        let raw_value = crate::util::read_u64_le(&data[macho_offset..]);
 
         let delta = ((raw_value & delta_mask) >> delta_shift) as u64;
 
@@ -306,17 +295,14 @@ fn process_slide_info_v3(
         auth_value_add, page_count
     );
 
-    // Collect page info for parallel processing
+    // Collect page info for parallel processing (optimized u16 reads)
     let page_infos: Vec<_> = (0..page_count)
         .filter_map(|page_idx| {
             let page_start_offset = page_starts_offset + page_idx * 2;
             if page_start_offset + 2 > cache_data.len() {
                 return None;
             }
-            let page_start = u16::from_le_bytes([
-                cache_data[page_start_offset],
-                cache_data[page_start_offset + 1],
-            ]);
+            let page_start = crate::util::read_u16_le(&cache_data[page_start_offset..]);
 
             // Skip pages with no rebasing
             if page_start == DYLD_CACHE_SLIDE_V3_PAGE_ATTR_NO_REBASE {
@@ -347,6 +333,10 @@ fn process_slide_info_v3(
 }
 
 /// Collects write operations for a v3 page without modifying the buffer.
+///
+/// # Performance
+///
+/// Uses optimized u64 reads that compile to single unaligned load instructions.
 #[inline]
 fn collect_v3_page_writes(
     data: &[u8],
@@ -369,16 +359,8 @@ fn collect_v3_page_writes(
             break;
         }
 
-        let raw_value = u64::from_le_bytes([
-            data[macho_offset],
-            data[macho_offset + 1],
-            data[macho_offset + 2],
-            data[macho_offset + 3],
-            data[macho_offset + 4],
-            data[macho_offset + 5],
-            data[macho_offset + 6],
-            data[macho_offset + 7],
-        ]);
+        // Optimized: single unaligned load
+        let raw_value = crate::util::read_u64_le(&data[macho_offset..]);
 
         let ptr = SlidePointer3(raw_value);
         let delta = ptr.offset_to_next() * 8;
@@ -440,17 +422,14 @@ fn process_slide_info_v5(
         value_add, page_count
     );
 
-    // Collect page info for parallel processing
+    // Collect page info for parallel processing (optimized u16 reads)
     let page_infos: Vec<_> = (0..page_count)
         .filter_map(|page_idx| {
             let page_start_offset = page_starts_offset + page_idx * 2;
             if page_start_offset + 2 > cache_data.len() {
                 return None;
             }
-            let page_start = u16::from_le_bytes([
-                cache_data[page_start_offset],
-                cache_data[page_start_offset + 1],
-            ]);
+            let page_start = crate::util::read_u16_le(&cache_data[page_start_offset..]);
 
             // Skip pages with no rebasing
             if page_start == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE {

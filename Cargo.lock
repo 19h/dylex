@@ -191,6 +191,7 @@ dependencies = [
  "clap",
  "indexmap",
  "indicatif",
+ "memchr",
  "memmap2",
  "pretty_assertions",
  "rayon",
