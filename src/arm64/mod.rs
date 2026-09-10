@@ -70,7 +70,7 @@ pub fn is_braa(instr: u32) -> bool {
 /// Returns true if the instruction is BRAAZ (authenticated branch, zero modifier).
 #[inline]
 pub fn is_braaz(instr: u32) -> bool {
-    (instr & 0xFFFF_FC1F) == 0xD71F_081F
+    (instr & 0xFFFF_FC1F) == 0xD61F_081F
 }
 
 /// Returns true if the instruction is a trap (BRK).
@@ -110,7 +110,7 @@ pub fn decode_adrp(instr: u32, pc: u64) -> u64 {
 
     // Scale by 4KB and add to page-aligned PC
     let offset = imm << 12;
-    (pc & !0xFFF).wrapping_add(offset as u64)
+    (pc & !0xFFF).wrapping_add(offset)
 }
 
 /// Decodes an ADD (immediate) instruction, returning the immediate value.
@@ -251,6 +251,13 @@ pub fn follow_adrp_add(adrp_addr: u64, instr0: u32, instr1: u32) -> Option<u64> 
     } else {
         None
     }
+}
+
+/// Decodes ADR's signed 21-bit byte displacement (not ADRP's page displacement).
+pub fn decode_adr(instr: u32, pc: u64) -> u64 {
+    let imm = (((instr >> 5) & 0x7ffff) << 2) | ((instr >> 29) & 3);
+    let signed = ((imm << 11) as i32 >> 11) as i64;
+    pc.wrapping_add_signed(signed)
 }
 
 #[cfg(test)]

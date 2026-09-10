@@ -21,9 +21,11 @@
 //! - Symbols: `dyld_shared_cache_arm64e.symbols`
 
 mod context;
+mod objc;
 mod structs;
 pub mod trie;
 
 pub use context::*;
+pub use objc::*;
 pub use structs::*;
 pub use trie::*;

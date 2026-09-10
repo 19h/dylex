@@ -10,7 +10,6 @@
 //! own `__auth_got` section and populates those GOT entries with resolved values.
 
 use crate::arm64;
-use crate::dyld::SlidePointer5;
 use crate::error::Result;
 use crate::macho::SectionInfo;
 use tracing::debug;
@@ -38,6 +37,10 @@ pub enum StubFormat {
     AuthResolver,
     /// Simple B instruction
     Branch,
+    /// ADR + MOVZ + shifted ADD + BR (16-byte far island).
+    Far,
+    /// Direct selector address followed by a tail branch (8 or 12 bytes).
+    ObjcSelector,
     /// Unrecognized format
     Unknown,
 }
@@ -49,6 +52,17 @@ pub enum StubFormat {
 /// Uses optimized u32 reads that compile to single unaligned load instructions.
 #[inline]
 pub fn detect_stub_format(data: &[u8], is_arm64e: bool) -> StubFormat {
+    if let Some(stub) = decode_cache_stub(data, 0x1_0000_0000) {
+        if stub.selector.is_some() {
+            return StubFormat::ObjcSelector;
+        }
+        if stub.size == 4 {
+            return StubFormat::Branch;
+        }
+        if !data.is_empty() && crate::util::read_u32_le(data) & 0x9f00_0000 == 0x1000_0000 {
+            return StubFormat::Far;
+        }
+    }
     if data.len() < 12 {
         return StubFormat::Unknown;
     }
@@ -343,12 +357,8 @@ fn fix_stub_section(
     let mut fixed = 0;
     let expected_stub_size = if is_arm64e { 16 } else { 12 };
 
-    // Get the slide info value_add for decoding pointers
-    // For arm64e caches, this is typically 0x180000000
-    let value_add = ctx.cache.slide_info_value_add().unwrap_or(0x180000000);
-
     // Process each stub
-    for i in 0..stub_info.count {
+    for i in 0..stub_info.count.min(ptr_info.count) {
         let stub_offset = stub_info.offset + i * stub_info.stub_size;
         let stub_addr = stub_info.addr + (i * stub_info.stub_size) as u64;
         let ptr_addr = ptr_info.addr + (i * 8) as u64;
@@ -385,15 +395,9 @@ fn fix_stub_section(
                         let encoded_value = u64::from_le_bytes(ptr_data.try_into().unwrap());
 
                         if encoded_value != 0 {
-                            // Decode the slide info v5 pointer
-                            let ptr = SlidePointer5(encoded_value);
-                            let decoded_value = if ptr.is_auth() {
-                                ptr.runtime_offset() + value_add
-                            } else {
-                                let runtime_offset = ptr.runtime_offset();
-                                let high8 = (ptr.high8() as u64) << 56;
-                                runtime_offset + value_add + high8
-                            };
+                            // The GOT may use v2, v3, v5, or plain pointers;
+                            // its own mapping determines the encoding.
+                            let decoded_value = ctx.cache.pointer_at(current_got_addr)?;
 
                             debug!(
                                 "Stub {} at 0x{:x}: external GOT 0x{:x} -> local GOT 0x{:x}, value 0x{:x} -> 0x{:x}",
@@ -473,6 +477,88 @@ fn fix_stub_section(
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// A recognized cache stub, decoded independently of per-image section markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedStub {
+    /// Number of instruction bytes in this stub.
+    pub size: usize,
+    /// Direct destination, or the pointer slot for an indirect stub.
+    pub target: u64,
+    /// True when target names a pointer slot that must be slide-decoded.
+    pub indirect: bool,
+    /// Selector string address for a compact Objective-C selector stub.
+    pub selector: Option<u64>,
+}
+
+/// Decodes validated ARM64 register dataflow for legacy and island stubs.
+/// O(1) time and space; returns None for truncated or mismatched instructions.
+pub fn decode_cache_stub(data: &[u8], pc: u64) -> Option<DecodedStub> {
+    let word = |n: usize| data.get(n * 4..n * 4 + 4).map(crate::util::read_u32_le);
+    let a = word(0)?;
+    let direct = |size, target, selector| {
+        Some(DecodedStub {
+            size,
+            target,
+            indirect: false,
+            selector,
+        })
+    };
+    if a & 0xfc00_0000 == 0x1400_0000 {
+        return direct(4, arm64::decode_branch(a, pc), None);
+    }
+    let b = word(1)?;
+    if a & 0x9f00_001f == 0x1000_0001 && b & 0xfc00_0000 == 0x1400_0000 {
+        return direct(
+            8,
+            arm64::decode_branch(b, pc + 4),
+            Some(arm64::decode_adr(a, pc)),
+        );
+    }
+    let c = word(2)?;
+    // ADR X16; MOVZ X17,#imm16; ADD X16,X16,X17,LSL #21; BR X16.
+    if a & 0x9f00_001f == 0x1000_0010
+        && b & 0xffe0_001f == 0xd280_0011
+        && c == 0x8b11_5610
+        && word(3)? == arm64::encode_br(16)
+    {
+        let target = arm64::decode_adr(a, pc).checked_add((((b >> 5) & 0xffff) as u64) << 21)?;
+        return direct(16, target, None);
+    }
+    if !arm64::is_adrp(a) {
+        return None;
+    }
+    let rd = a & 31;
+    let page = arm64::decode_adrp(a, pc);
+    // Only 64-bit, unshifted ADD with matching base/destination registers.
+    if b & 0xffc0_0000 == 0x9100_0000 && b & 31 == rd && (b >> 5) & 31 == rd {
+        let target = page.checked_add(arm64::decode_add_imm(b) as u64)?;
+        if rd == 1 && c & 0xfc00_0000 == 0x1400_0000 {
+            return direct(12, arm64::decode_branch(c, pc + 8), Some(target));
+        }
+        if rd == 16 && c == arm64::encode_br(16) {
+            return direct(12, target, None);
+        }
+        if rd == 17 && c & 0xffc0_03ff == 0xf940_0230 && word(3)? == arm64::encode_braa(16, 17) {
+            return Some(DecodedStub {
+                size: 16,
+                target: target.checked_add(arm64::decode_ldr_offset(c) as u64)?,
+                indirect: true,
+                selector: None,
+            });
+        }
+    }
+    if rd == 16 && b & 0xffc0_03ff == 0xf940_0210 && (c == arm64::encode_br(16) || c == 0xd61f_0a1f)
+    {
+        return Some(DecodedStub {
+            size: 12,
+            target: page.checked_add(arm64::decode_ldr_offset(b) as u64)?,
+            indirect: true,
+            selector: None,
+        });
+    }
+    None
+}
 
 #[cfg(test)]
 mod tests {
