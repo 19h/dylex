@@ -7,7 +7,7 @@
 
 A high-performance dyld shared cache extractor for macOS and iOS, written in Rust.
 
-dylex extracts individual Mach-O binaries from Apple's dyld shared cache with full symbol table reconstruction, pointer rebasing, and proper LINKEDIT optimization. Extracted binaries are suitable for reverse engineering, analysis, and research.
+dylex extracts Mach-O files for static analysis from Apple's dyld shared cache, with symbol table reconstruction, pointer decoding, and LINKEDIT rebuilding. Extraction does not reconstruct a runnable OS loader environment.
 
 ## Features
 
@@ -16,9 +16,13 @@ dylex extracts individual Mach-O binaries from Apple's dyld shared cache with fu
 - **Architecture Selection** - Support for arm64, arm64e, and x86_64 caches
 - **Symbol Table Reconstruction** - Rebuilds standalone LINKEDIT with proper symbol tables
 - **Pointer Rebasing** - Handles slide info v3/v5 for correct pointer values
-- **ObjC Metadata Fixing** - Clears optimization flags for standalone operation
+- **ObjC Metadata Restoration** - Reconstructs coalesced strings and absolute method entries before clearing encoding flags
+- **Cache Islands** - Retains referenced sectionless ARM64 stubs and `libobjcMsgSend*` dispatcher code
+- **Rosetta Cache Products** - Discovers native, full Rosetta, and reduced `x86Support` trees separately
 - **Directory Structure Preservation** - Optionally preserves full framework paths
 - **Batch Extraction** - Extract multiple images with filters and parallel processing
+
+See [cache compatibility and validation](docs/cache-compatibility.md) for the tested macOS 27 build, older-format fixtures, source provenance, assumptions, and mode limitations.
 
 ## Installation
 
@@ -204,9 +208,22 @@ Options:
 
 When no cache path is specified, dylex searches these locations in order:
 
-1. `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld` (macOS Ventura+)
-2. `/System/Library/dyld` (older macOS)
-3. `/var/db/dyld`
+1. `/System/Volumes/Preboot/Cryptexes` (native OS and Rosetta products)
+2. `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld`
+3. `/System/Library/dyld`
+4. `/var/db/dyld`
+
+Commands without `--arch` retain the native system-cache default. `dylex arches`
+lists each product separately. When `--arch x86` matches both Rosetta caches, an
+exact main-file path selects the product:
+
+```bash
+dylex info /System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/dyld_shared_cache_x86_64
+dylex info /System/Volumes/Preboot/Cryptexes/Rosetta/System/x86Support/System/Library/dyld/dyld_shared_cache_x86_64
+```
+
+These Rosetta paths were observed on macOS 27 build `26A5425a`. Discovery excludes
+staged `Incoming` updates and DriverKit subtrees unless selected explicitly.
 
 ## Architecture Selection
 
@@ -315,7 +332,10 @@ Typical extraction times on Apple M1:
 - **macOS/iOS only** - dyld caches are Apple-specific
 - **Read-only** - Cannot modify or repack caches
 - **No code signing** - Extracted binaries need re-signing for execution
-- **Stub fixing** - Some inter-library stubs may not be fully resolved
+- **External references** - Ordinary inter-library targets can remain external
+- **Analysis layout** - Images with insufficient header padding use a separate `__DYLEX_HDR` segment; original code addresses remain unchanged
+- **Unknown extensions** - Version-4 ObjC optimization fields after the common prefix are not interpreted as version-2 buffer sizes
+- **Merged extraction** - `--merge-deps` retains its separate experimental relocation pipeline; Golden Gate behavior for that mode has not been validated
 
 ## Comparison with Other Tools
 
@@ -349,12 +369,8 @@ dylex info -a arm64e
 
 ### Extracted binary won't run
 
-Extracted binaries are not code-signed. For research/analysis only:
-
-```bash
-# Re-sign for local execution (macOS)
-codesign -f -s - extracted_binary
-```
+Extraction produces files for static analysis. Code signing alone does not restore
+bind/rebase metadata, cache-wide runtime state, or unresolved external references.
 
 ### Large extracted file sizes
 

@@ -18,15 +18,18 @@
 mod context;
 mod fixup;
 mod linkedit;
+mod materialize;
 pub mod merger;
 mod objc;
 mod slide;
 mod stub;
+mod support;
 mod writer;
 
 pub use context::*;
 pub use fixup::*;
 pub use linkedit::*;
+pub use materialize::*;
 pub use merger::{
     MergeContext, fix_merged_pointers, fix_merged_stubs, include_shared_regions,
     inject_dependency_segments, merge_images, rebuild_merged_linkedit, resolve_indirect_pointers,
@@ -35,4 +38,5 @@ pub use merger::{
 pub use objc::*;
 pub use slide::*;
 pub use stub::*;
+pub use support::include_cache_support;
 pub use writer::*;

@@ -196,7 +196,7 @@ impl DyldCacheHeader {
         magic_str
             .trim_start_matches("dyld_v0")
             .trim_start_matches("dyld_v1")
-            .trim()
+            .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0')
     }
 
     /// Checks if a header field exists based on mapping_offset.
@@ -204,26 +204,33 @@ impl DyldCacheHeader {
         field_offset < self.mapping_offset as usize
     }
 
+    /// Checks that the entire field fits in this generation's header.
+    pub fn contains_field_range(&self, offset: usize, size: usize) -> bool {
+        offset
+            .checked_add(size)
+            .is_some_and(|end| end <= self.mapping_offset as usize)
+    }
+
     /// Returns true if this is a valid dyld cache header.
     pub fn is_valid(&self) -> bool {
-        &self.magic[..4] == DYLD_CACHE_MAGIC_PREFIX
+        self.magic.starts_with(b"dyld_v0 ") || self.magic.starts_with(b"dyld_v1 ")
     }
 
     /// Returns true if this cache has subcaches.
     pub fn has_subcaches(&self) -> bool {
-        self.contains_field(offset_of!(Self, sub_cache_array_count))
+        self.contains_field_range(offset_of!(Self, sub_cache_array_count), 4)
             && self.sub_cache_array_count > 0
     }
 
     /// Returns true if this cache has a separate symbols file.
     pub fn has_symbol_file(&self) -> bool {
-        self.contains_field(offset_of!(Self, symbol_file_uuid))
+        self.contains_field_range(offset_of!(Self, symbol_file_uuid), 16)
             && self.symbol_file_uuid != [0u8; 16]
     }
 
     /// Returns true if this cache uses the new images location.
     pub fn uses_new_images_offset(&self) -> bool {
-        self.contains_field(offset_of!(Self, images_offset)) && self.images_offset != 0
+        self.contains_field_range(offset_of!(Self, images_count), 4)
     }
 
     /// Returns the actual images offset (new or legacy location).
@@ -450,8 +457,8 @@ impl SlidePointer3 {
     /// For plain pointers: returns the decoded value.
     #[inline]
     pub fn plain_value(&self) -> u64 {
-        // Sign extend from 51 bits
-        let value = self.0 & 0x0007_FFFF_FFFF_FFFF;
+        // Repack the low 43 address bits and the separately stored top byte.
+        let value = self.0 & 0x0000_07FF_FFFF_FFFF;
         let top8 = ((self.0 >> 43) & 0xFF) as u8;
         ((top8 as u64) << 56) | value
     }
@@ -472,19 +479,19 @@ impl SlidePointer5 {
     /// Returns the offset to the next rebase (in 8-byte units).
     #[inline]
     pub fn next(&self) -> u64 {
-        (self.0 >> 51) & 0x7FF
+        (self.0 >> 52) & 0x7FF
     }
 
     /// Returns the runtime offset (for both auth and non-auth).
     #[inline]
     pub fn runtime_offset(&self) -> u64 {
-        self.0 & 0x0007_FFFF_FFFF_FFFF
+        self.0 & 0x0000_0003_FFFF_FFFF
     }
 
     /// For non-auth pointers: returns the high 8 bits.
     #[inline]
     pub fn high8(&self) -> u8 {
-        ((self.0 >> 43) & 0xFF) as u8
+        ((self.0 >> 34) & 0xFF) as u8
     }
 }
 

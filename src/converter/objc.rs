@@ -1,15 +1,11 @@
-//! ObjC metadata fixer.
-//!
-//! In the dyld shared cache, ObjC metadata is optimized:
-//! - Selectors are uniqued and stored in libobjc's selector table
-//! - Class data may reference shared RO data
-//! - Method lists use direct selector references
-//!
-//! This module fixes these optimizations for standalone operation.
-
-use crate::error::Result;
-
-use super::ExtractionContext;
+//! Restore cache-coalesced Objective-C metadata for static analysis. Relative
+//! method entries become ordinary 24-byte absolute entries, and referenced
+//! strings/metadata are serialized into one mapped __EXTRA_OBJC segment.
+use super::{ExtractionContext, support::append_segment};
+use crate::dyld::ObjcOptimization;
+use crate::util::{read_u32_le, read_u64_le};
+use crate::{DyldContext, Error, Result};
+use std::collections::{HashMap, HashSet};
 
 // =============================================================================
 // ObjC Image Info Flags
@@ -43,313 +39,536 @@ pub const METHOD_LIST_RELATIVE_FLAG: u32 = 0x8000_0000;
 /// Method list has direct selector references (no indirection).
 pub const METHOD_LIST_DIRECT_SEL_FLAG: u32 = 0x4000_0000;
 
-/// Method list uses uniqued selectors.
-pub const METHOD_LIST_UNIQUED_FLAG: u32 = 0x2000_0000;
+/// Type string offsets are relative to the global selector base.
+pub const METHOD_LIST_TYPE_OFFSETS_FLAG: u32 = 0x2000_0000;
+
+/// Historical API alias; this bit encodes base-relative types, not uniquing.
+#[deprecated(note = "use METHOD_LIST_TYPE_OFFSETS_FLAG; this is an encoding bit")]
+pub const METHOD_LIST_UNIQUED_FLAG: u32 = METHOD_LIST_TYPE_OFFSETS_FLAG;
 
 /// Mask for method list entry count.
 pub const METHOD_LIST_COUNT_MASK: u32 = 0x00FF_FFFF;
 
-// Reserved for future use when converting method list formats
-#[allow(dead_code)]
-const RELATIVE_METHOD_SIZE: usize = 12;
-#[allow(dead_code)]
-const OLD_METHOD_SIZE: usize = 24;
-
-// =============================================================================
-// ObjC Fixer Implementation
-// =============================================================================
-
-/// Fixes ObjC metadata in the extracted image.
-///
-/// This function performs the following fixes:
-/// 1. Fixes method lists with direct selector references
-/// 2. Clears the uniqued selectors flag from method lists
-///
-/// Note: The OBJC_IMAGE_OPTIMIZED_BY_DYLD flag is preserved because the
-/// ObjC metadata is still in its optimized form after extraction.
-/// Apple's dsc_extractor also preserves this flag.
+/// Restores method encodings before clearing optimization flags. Source reads
+/// always use cache VM addresses and mapping-specific slide formats.
 pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
-    // Find __objc_imageinfo section
-    let imageinfo = ctx
+    let roots: Vec<_> = ctx
         .macho
-        .section("__DATA", "__objc_imageinfo")
-        .or_else(|| ctx.macho.section("__DATA_CONST", "__objc_imageinfo"));
-
-    let imageinfo = match imageinfo {
-        Some(sect) => sect.clone(),
-        None => {
-            ctx.info("No ObjC image info found, skipping ObjC fixing");
-            return Ok(());
-        }
+        .segments()
+        .flat_map(|s| &s.sections)
+        .filter(|s| {
+            matches!(
+                s.name(),
+                "__objc_classlist"
+                    | "__objc_nlclslist"
+                    | "__objc_catlist"
+                    | "__objc_nlcatlist"
+                    | "__objc_protolist"
+                    | "__objc_selrefs"
+            )
+        })
+        .map(|s| (s.name().to_string(), s.section.addr, s.section.size))
+        .collect();
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let cache = std::sync::Arc::clone(&ctx.cache);
+    // Absolute method entries have no signed-relative reach constraint. Place
+    // new metadata beyond all cache VM ranges to avoid collision with imports.
+    let end = cache
+        .mappings
+        .iter()
+        .map(|m| m.address + m.size)
+        .max()
+        .unwrap_or(0);
+    let base = end
+        .checked_add(0x3fff)
+        .map(|v| v & !0x3fff)
+        .ok_or_else(|| invalid("ObjC output address overflow"))?;
+    let category_class_properties = ctx
+        .macho
+        .segments()
+        .flat_map(|s| &s.sections)
+        .filter(|s| s.name() == "__objc_imageinfo" && s.section.size >= 8)
+        .map(|s| {
+            cache
+                .data_at_addr(s.section.addr, 8)
+                .map(|data| read_u32_le(&data[4..]) & (1 << 6) != 0)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .any(|v| v);
+    let mut builder = ObjcBuilder {
+        cache: &cache,
+        opts: cache.objc_optimization()?,
+        base,
+        category_class_properties,
+        data: Vec::new(),
+        strings: HashMap::new(),
+        objects: HashMap::new(),
+        active_lists: HashSet::new(),
     };
-
-    // Read and check image info flags
-    let offset = imageinfo.section.offset as usize;
-    if offset + 8 > ctx.macho.data.len() {
+    let mut patches = Vec::new();
+    let mut classes = HashSet::new();
+    for (kind, start, size) in roots {
+        if size % 8 != 0 {
+            return Err(invalid("misaligned ObjC pointer section"));
+        }
+        cache.data_at_addr(start, size as usize)?;
+        for slot in (start..start + size).step_by(8) {
+            let addr = clean(cache.pointer_at(slot)?);
+            tracing::debug!("ObjC root {kind} at {slot:#x} -> {addr:#x}");
+            if addr == 0 {
+                continue;
+            }
+            match kind.as_str() {
+                "__objc_classlist" | "__objc_nlclslist" => {
+                    let mut pending = vec![addr];
+                    while let Some(class) = pending.pop() {
+                        if !classes.insert(class) || !ctx.macho.contains_addr(class) {
+                            continue;
+                        }
+                        cache.data_at_addr(class, 40)?;
+                        let ro = clean(cache.pointer_at(class + 32)?) & !7;
+                        if ro != 0 {
+                            let new_ro = builder.class_ro(ro)?;
+                            let bits = cache.pointer_at(class + 32)? & 7;
+                            patches.push((class + 32, new_ro | bits));
+                        }
+                        let isa = clean(cache.pointer_at(class)?);
+                        if isa != 0 && isa != class {
+                            pending.push(isa);
+                        }
+                    }
+                }
+                "__objc_catlist" | "__objc_nlcatlist" => {
+                    patches.push((slot, builder.category(addr)?))
+                }
+                "__objc_protolist" => patches.push((slot, builder.protocol(addr)?)),
+                "__objc_selrefs" => patches.push((slot, builder.string(addr)?)),
+                _ => unreachable!(),
+            }
+        }
+    }
+    // Mutate only after the complete graph has been decoded successfully.
+    if builder.data.is_empty() {
         return Ok(());
     }
-
-    // Optimized: single unaligned load
-    let flags = crate::util::read_u32_le(&ctx.macho.data[offset + 4..]);
-
-    if (flags & OBJC_IMAGE_OPTIMIZED_BY_DYLD) == 0 {
-        ctx.info("ObjC not optimized by dyld, skipping");
-        return Ok(());
+    append_segment(ctx, "__EXTRA_OBJC", base, &builder.data, 1)?;
+    for (addr, value) in patches {
+        let offset = ctx
+            .macho
+            .addr_to_offset(addr)
+            .ok_or(Error::AddressNotFound { addr })?;
+        ctx.macho.write_u64(offset, value)?;
     }
-
-    ctx.info("Fixing ObjC metadata...");
-
-    // Note: We preserve OBJC_IMAGE_OPTIMIZED_BY_DYLD flag - Apple's dsc_extractor
-    // does the same. The metadata is still optimized after extraction.
-
-    // Fix method lists in classes
-    let mut fixed_methods = 0;
-    fixed_methods += fix_class_method_lists(ctx)?;
-
-    // Fix method lists in categories
-    fixed_methods += fix_category_method_lists(ctx)?;
-
-    if fixed_methods > 0 {
-        ctx.info(&format!("Fixed {} method lists", fixed_methods));
+    let image_infos: Vec<_> = ctx
+        .macho
+        .segments()
+        .flat_map(|s| &s.sections)
+        .filter(|s| s.name() == "__objc_imageinfo" && s.section.size >= 8)
+        .map(|s| s.section.offset as usize)
+        .collect();
+    for offset in image_infos {
+        let flags = ctx.macho.read_u32(offset + 4)?;
+        ctx.macho
+            .write_u32(offset + 4, flags & !OBJC_IMAGE_OPTIMIZED_BY_DYLD)?;
     }
-
+    ctx.info(&format!(
+        "Restored Objective-C metadata ({} bytes)",
+        builder.data.len()
+    ));
     Ok(())
 }
 
-/// Fixes method lists in all classes.
-fn fix_class_method_lists(ctx: &mut ExtractionContext) -> Result<usize> {
-    // Get __objc_classlist section
-    let classlist = ctx
-        .macho
-        .section("__DATA", "__objc_classlist")
-        .or_else(|| ctx.macho.section("__DATA_CONST", "__objc_classlist"));
+struct ObjcBuilder<'a> {
+    cache: &'a DyldContext,
+    opts: Option<ObjcOptimization>,
+    base: u64,
+    data: Vec<u8>,
+    category_class_properties: bool,
+    strings: HashMap<u64, u64>,
+    objects: HashMap<(u64, u8), u64>,
+    active_lists: HashSet<(u64, u8)>,
+}
 
-    let classlist = match classlist {
-        Some(s) => s.clone(),
-        None => return Ok(0),
+impl ObjcBuilder<'_> {
+    fn reserve(&mut self, size: usize) -> Result<(u64, usize)> {
+        let off = self
+            .data
+            .len()
+            .checked_add(7)
+            .map(|v| v & !7)
+            .ok_or_else(|| invalid("ObjC output size overflow"))?;
+        let end = off
+            .checked_add(size)
+            .filter(|n| *n <= u32::MAX as usize)
+            .ok_or_else(|| invalid("ObjC output exceeds file offset limit"))?;
+        self.base
+            .checked_add(end as u64)
+            .ok_or_else(|| invalid("ObjC output address overflow"))?;
+        self.data.resize(end, 0);
+        Ok((self.base + off as u64, off))
+    }
+    fn put(&mut self, off: usize, value: u64) {
+        self.data[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    fn ptr(&self, addr: u64) -> Result<u64> {
+        Ok(clean(self.cache.pointer_at(addr).map_err(|e| {
+            invalid(&format!("ObjC pointer at {addr:#x}: {e}"))
+        })?))
+    }
+    fn string(&mut self, addr: u64) -> Result<u64> {
+        if addr == 0 {
+            return Ok(0);
+        }
+        if let Some(&value) = self.strings.get(&addr) {
+            return Ok(value);
+        }
+        let string = self
+            .cache
+            .cstring_at(addr)
+            .map_err(|e| invalid(&format!("ObjC string {addr:#x}: {e}")))?;
+        let (value, off) = self.reserve(string.len())?;
+        self.data[off..off + string.len()].copy_from_slice(string);
+        self.strings.insert(addr, value);
+        Ok(value)
+    }
+    fn string_field(&mut self, src: u64, dst: usize) -> Result<()> {
+        let ptr = self.ptr(src)?;
+        let value = self.string(ptr)?;
+        self.put(dst, value);
+        Ok(())
+    }
+    fn record(&mut self, addr: u64, size: usize, pointers: &[usize]) -> Result<(u64, usize)> {
+        let bytes = self
+            .cache
+            .data_at_addr(addr, size)
+            .map_err(|e| invalid(&format!("ObjC record {addr:#x} ({size} bytes): {e}")))?;
+        let (value, off) = self.reserve(size)?;
+        self.data[off..off + size].copy_from_slice(bytes);
+        for &field in pointers {
+            let p = self.ptr(addr + field as u64)?;
+            self.put(off + field, p);
+        }
+        Ok((value, off))
+    }
+    fn class_ro(&mut self, addr: u64) -> Result<u64> {
+        tracing::debug!("class_ro {addr:#x}");
+        if let Some(&value) = self.objects.get(&(addr, 0)) {
+            return Ok(value);
+        }
+        let (value, off) = self.record(addr, 72, &[16, 24, 32, 40, 48, 56, 64])?;
+        self.objects.insert((addr, 0), value);
+        for field in [16, 24, 56] {
+            self.string_field(addr + field as u64, off + field)?;
+        }
+        let methods = self.methods(self.ptr(addr + 32)?)?;
+        self.put(off + 32, methods);
+        let protocols = self.protocol_list(self.ptr(addr + 40)?)?;
+        self.put(off + 40, protocols);
+        let ivars = self.fields(self.ptr(addr + 48)?, true)?;
+        self.put(off + 48, ivars);
+        let properties = self.fields(self.ptr(addr + 64)?, false)?;
+        self.put(off + 64, properties);
+        Ok(value)
+    }
+    fn category(&mut self, addr: u64) -> Result<u64> {
+        if let Some(&value) = self.objects.get(&(addr, 1)) {
+            return Ok(value);
+        }
+        let size = if self.category_class_properties {
+            56
+        } else {
+            48
+        };
+        let (value, off) = self.record(addr, size, &[0, 8, 16, 24, 32, 40])?;
+        self.objects.insert((addr, 1), value);
+        self.string_field(addr, off)?;
+        for field in [16, 24] {
+            let methods = self.methods(self.ptr(addr + field)?)?;
+            self.put(off + field as usize, methods);
+        }
+        let protocols = self.protocol_list(self.ptr(addr + 32)?)?;
+        self.put(off + 32, protocols);
+        let properties = self.fields(self.ptr(addr + 40)?, false)?;
+        self.put(off + 40, properties);
+        if self.category_class_properties {
+            let properties = self.fields(self.ptr(addr + 48)?, false)?;
+            self.put(off + 48, properties);
+        }
+        Ok(value)
+    }
+    fn protocol(&mut self, addr: u64) -> Result<u64> {
+        if addr == 0 {
+            return Ok(0);
+        }
+        if let Some(&value) = self.objects.get(&(addr, 2)) {
+            return Ok(value);
+        }
+        let prefix = self.cache.data_at_addr(addr, 72)?;
+        let size = read_u32_le(&prefix[64..]) as usize;
+        if !(72..=4096).contains(&size) {
+            return Err(invalid("invalid ObjC protocol size"));
+        }
+        let (value, off) = self.record(addr, size, &[0, 8, 16, 24, 32, 40, 48, 56])?;
+        self.objects.insert((addr, 2), value);
+        self.string_field(addr + 8, off + 8)?;
+        let protocols = self.protocol_list(self.ptr(addr + 16)?)?;
+        self.put(off + 16, protocols);
+        let mut count = 0;
+        for field in [24, 32, 40, 48] {
+            let methods = self.methods(self.ptr(addr + field)?)?;
+            if methods != 0 {
+                count += read_u32_le(&self.data[(methods - self.base) as usize + 4..]) as usize;
+            }
+            self.put(off + field as usize, methods);
+        }
+        let properties = self.fields(self.ptr(addr + 56)?, false)?;
+        self.put(off + 56, properties);
+        if size >= 80 {
+            let types = self.ptr(addr + 72)?;
+            let new_types = if types == 0 {
+                0
+            } else {
+                self.cache.data_at_addr(
+                    types,
+                    count
+                        .checked_mul(8)
+                        .ok_or_else(|| invalid("protocol type count overflow"))?,
+                )?;
+                let (v, o) = self.reserve(count * 8)?;
+                for i in 0..count {
+                    self.string_field(types + (i * 8) as u64, o + i * 8)?;
+                }
+                v
+            };
+            self.put(off + 72, new_types);
+        }
+        if size >= 88 {
+            self.string_field(addr + 80, off + 80)?;
+        }
+        if size >= 96 {
+            let props = self.fields(self.ptr(addr + 88)?, false)?;
+            self.put(off + 88, props);
+        }
+        Ok(value)
+    }
+    // Expand a tagged relative list-of-lists with signed 48-bit offsets. The
+    // cache is a static snapshot; all constituent lists are retained for analysis.
+    fn lists(&mut self, addr: u64, kind: u8) -> Result<Vec<u64>> {
+        if addr == 0 {
+            return Ok(Vec::new());
+        }
+        if addr & 1 == 0 {
+            return Ok(vec![addr]);
+        }
+        if !self.active_lists.insert((addr, kind)) {
+            return Err(invalid("cyclic ObjC relative list"));
+        }
+        let start = addr & !1;
+        let h = self.cache.data_at_addr(start, 8)?;
+        if read_u32_le(h) != 8 {
+            return Err(invalid("unsupported ObjC relative list entry size"));
+        }
+        let count = read_u32_le(&h[4..]) as usize;
+        let bytes = self.cache.data_at_addr(
+            start + 8,
+            count
+                .checked_mul(8)
+                .ok_or_else(|| invalid("relative list size overflow"))?,
+        )?;
+        let mut out = Vec::new();
+        for (i, entry) in bytes.chunks_exact(8).enumerate() {
+            let field = start + 8 + (i * 8) as u64;
+            let target = field
+                .checked_add_signed((read_u64_le(entry) as i64) >> 16)
+                .ok_or_else(|| invalid("relative list address overflow"))?;
+            out.extend(self.lists(target, kind)?);
+        }
+        self.active_lists.remove(&(addr, kind));
+        Ok(out)
+    }
+    fn methods(&mut self, addr: u64) -> Result<u64> {
+        if addr == 0 {
+            return Ok(0);
+        }
+        if let Some(&value) = self.objects.get(&(addr, 3)) {
+            return Ok(value);
+        }
+        let mut methods = Vec::new();
+        for list in self.lists(addr, 3)? {
+            tracing::debug!("method list {list:#x}");
+            let h = self.cache.data_at_addr(list, 8)?;
+            let flags = read_u32_le(h);
+            let count = read_u32_le(&h[4..]) as usize;
+            let relative = flags & METHOD_LIST_RELATIVE_FLAG != 0;
+            let stride = (flags & 0xfffc) as usize;
+            if count == 0 {
+                continue;
+            }
+            if stride < if relative { 12 } else { 24 } {
+                return Err(invalid(&format!(
+                    "invalid method entry size at {list:#x}: flags={flags:#x}, count={count}"
+                )));
+            }
+            let entries = self.cache.data_at_addr(
+                list + 8,
+                count
+                    .checked_mul(stride)
+                    .ok_or_else(|| invalid("method list size overflow"))?,
+            )?;
+            for (i, entry) in entries.chunks_exact(stride).enumerate() {
+                let field = list + 8 + (i * stride) as u64;
+                let (name, types, imp) = if relative {
+                    resolve_relative_method(self.cache, self.opts, flags, field, entry)?
+                } else {
+                    (
+                        self.ptr(field)?,
+                        self.ptr(field + 8)?,
+                        self.ptr(field + 16)?,
+                    )
+                };
+                methods.push((self.string(name)?, self.string(types)?, imp));
+            }
+        }
+        let count = u32::try_from(methods.len()).map_err(|_| invalid("method count overflow"))?;
+        let (value, off) = self.reserve(8 + methods.len() * 24)?;
+        self.data[off..off + 4].copy_from_slice(&24u32.to_le_bytes());
+        self.data[off + 4..off + 8].copy_from_slice(&count.to_le_bytes());
+        for (i, (name, types, imp)) in methods.into_iter().enumerate() {
+            self.put(off + 8 + i * 24, name);
+            self.put(off + 16 + i * 24, types);
+            self.put(off + 24 + i * 24, imp);
+        }
+        self.objects.insert((addr, 3), value);
+        Ok(value)
+    }
+    fn protocol_list(&mut self, addr: u64) -> Result<u64> {
+        if addr == 0 {
+            return Ok(0);
+        }
+        if let Some(&value) = self.objects.get(&(addr, 4)) {
+            return Ok(value);
+        }
+        let mut protocols = Vec::new();
+        for list in self.lists(addr, 4)? {
+            let count = usize::try_from(read_u64_le(self.cache.data_at_addr(list, 8)?))
+                .map_err(|_| invalid("protocol list count overflow"))?;
+            self.cache.data_at_addr(
+                list + 8,
+                count
+                    .checked_mul(8)
+                    .ok_or_else(|| invalid("protocol list size overflow"))?,
+            )?;
+            for i in 0..count {
+                protocols.push(self.ptr(list + 8 + (i * 8) as u64)?);
+            }
+        }
+        let (value, off) = self.reserve(8 + protocols.len() * 8)?;
+        self.objects.insert((addr, 4), value);
+        self.put(off, protocols.len() as u64);
+        for (i, p) in protocols.into_iter().enumerate() {
+            let v = self.protocol(p)?;
+            self.put(off + 8 + i * 8, v);
+        }
+        Ok(value)
+    }
+    fn fields(&mut self, addr: u64, ivars: bool) -> Result<u64> {
+        if addr == 0 {
+            return Ok(0);
+        }
+        let kind = if ivars { 5 } else { 6 };
+        if let Some(&value) = self.objects.get(&(addr, kind)) {
+            return Ok(value);
+        }
+        let stride = if ivars { 32 } else { 16 };
+        let mut entries = Vec::new();
+        for list in self.lists(addr, kind)? {
+            let h = self.cache.data_at_addr(list, 8)?;
+            let source_stride = read_u32_le(h) as usize;
+            let count = read_u32_le(&h[4..]) as usize;
+            if count == 0 {
+                continue;
+            }
+            if source_stride < stride {
+                return Err(invalid(&format!(
+                    "invalid property/ivar entry size {source_stride} at {list:#x} (ivars={ivars}, count={count})"
+                )));
+            }
+            self.cache.data_at_addr(
+                list + 8,
+                count
+                    .checked_mul(source_stride)
+                    .ok_or_else(|| invalid("field list size overflow"))?,
+            )?;
+            for i in 0..count {
+                entries.push(list + 8 + (i * source_stride) as u64);
+            }
+        }
+        let (value, off) = self.reserve(8 + entries.len() * stride)?;
+        self.data[off..off + 4].copy_from_slice(&(stride as u32).to_le_bytes());
+        self.data[off + 4..off + 8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (i, src) in entries.into_iter().enumerate() {
+            let dst = off + 8 + i * stride;
+            self.data[dst..dst + stride].copy_from_slice(self.cache.data_at_addr(src, stride)?);
+            if ivars {
+                let ptr = self.ptr(src)?;
+                if ptr != 0 {
+                    let bytes = self.cache.data_at_addr(ptr, 4)?;
+                    let (v, o) = self.reserve(4)?;
+                    self.data[o..o + 4].copy_from_slice(bytes);
+                    self.put(dst, v);
+                }
+                self.string_field(src + 8, dst + 8)?;
+                self.string_field(src + 16, dst + 16)?;
+            } else {
+                self.string_field(src, dst)?;
+                self.string_field(src + 8, dst + 8)?;
+            }
+        }
+        self.objects.insert((addr, kind), value);
+        Ok(value)
+    }
+}
+
+fn resolve_relative_method(
+    cache: &DyldContext,
+    opts: Option<ObjcOptimization>,
+    flags: u32,
+    field: u64,
+    entry: &[u8],
+) -> Result<(u64, u64, u64)> {
+    let relative = |base: u64, off: usize| {
+        base.checked_add_signed(read_u32_le(&entry[off..]) as i32 as i64)
+            .ok_or_else(|| invalid("relative method address overflow"))
     };
-
-    let count = classlist.section.size as usize / 8;
-    let mut fixed = 0;
-
-    for i in 0..count {
-        let ptr_offset = classlist.section.offset as usize + i * 8;
-        if ptr_offset + 8 > ctx.macho.data.len() {
-            break;
-        }
-
-        // Read class pointer (optimized: single unaligned load)
-        let class_addr = crate::util::read_u64_le(&ctx.macho.data[ptr_offset..]);
-
-        // Unmask pointer (clear top byte for arm64e)
-        let class_addr = class_addr & 0x0000_FFFF_FFFF_FFFF;
-
-        if let Some(class_offset) = ctx.macho.addr_to_offset(class_addr) {
-            fixed += fix_class_at(ctx, class_offset)?;
-        }
-    }
-
-    Ok(fixed)
-}
-
-/// Fixes a single class's method lists.
-fn fix_class_at(ctx: &mut ExtractionContext, class_offset: usize) -> Result<usize> {
-    // objc_class structure:
-    // +0:  isa (8 bytes)
-    // +8:  superclass (8 bytes)
-    // +16: cache (16 bytes)
-    // +32: vtable (8 bytes)
-    // +40: data (8 bytes) - points to class_ro_t or class_rw_t
-
-    if class_offset + 48 > ctx.macho.data.len() {
-        return Ok(0);
-    }
-
-    // Read data pointer (at offset 32 in the class, optimized load)
-    let data_addr = crate::util::read_u64_le(&ctx.macho.data[class_offset + 32..]);
-
-    // Unmask and check low bits
-    let data_addr = data_addr & 0x0000_FFFF_FFFF_FFF8; // Clear low 3 bits and top byte
-
-    if let Some(data_offset) = ctx.macho.addr_to_offset(data_addr) {
-        return fix_class_ro(ctx, data_offset);
-    }
-
-    Ok(0)
-}
-
-/// Fixes method lists in a class_ro_t structure.
-fn fix_class_ro(ctx: &mut ExtractionContext, ro_offset: usize) -> Result<usize> {
-    // class_ro_t structure (simplified):
-    // +0:  flags (4 bytes)
-    // +4:  instanceStart (4 bytes)
-    // +8:  instanceSize (4 bytes)
-    // +12: reserved (4 bytes) on 64-bit
-    // +16: ivarLayout (8 bytes)
-    // +24: name (8 bytes)
-    // +32: baseMethods (8 bytes)
-    // +40: baseProtocols (8 bytes)
-    // +48: ivars (8 bytes)
-    // +56: weakIvarLayout (8 bytes)
-    // +64: baseProperties (8 bytes)
-
-    if ro_offset + 72 > ctx.macho.data.len() {
-        return Ok(0);
-    }
-
-    // Read baseMethods pointer (optimized load)
-    let methods_addr = crate::util::read_u64_le(&ctx.macho.data[ro_offset + 32..]);
-
-    if methods_addr == 0 {
-        return Ok(0);
-    }
-
-    let methods_addr = methods_addr & 0x0000_FFFF_FFFF_FFFF;
-
-    if let Some(methods_offset) = ctx.macho.addr_to_offset(methods_addr) {
-        return fix_method_list(ctx, methods_offset);
-    }
-
-    Ok(0)
-}
-
-/// Fixes method lists in all categories.
-fn fix_category_method_lists(ctx: &mut ExtractionContext) -> Result<usize> {
-    // Get __objc_catlist section
-    let catlist = ctx
-        .macho
-        .section("__DATA", "__objc_catlist")
-        .or_else(|| ctx.macho.section("__DATA_CONST", "__objc_catlist"));
-
-    let catlist = match catlist {
-        Some(s) => s.clone(),
-        None => return Ok(0),
+    let name = if flags & METHOD_LIST_DIRECT_SEL_FLAG != 0 {
+        // Prior to global-base optimization, direct names were self-relative.
+        relative(opts.map_or(field, |o| o.selector_base), 0)?
+    } else {
+        clean(cache.pointer_at(relative(field, 0)?)?)
     };
-
-    let count = catlist.section.size as usize / 8;
-    let mut fixed = 0;
-
-    for i in 0..count {
-        let ptr_offset = catlist.section.offset as usize + i * 8;
-        if ptr_offset + 8 > ctx.macho.data.len() {
-            break;
-        }
-
-        // Read category pointer (optimized load)
-        let cat_addr = crate::util::read_u64_le(&ctx.macho.data[ptr_offset..]);
-
-        let cat_addr = cat_addr & 0x0000_FFFF_FFFF_FFFF;
-
-        if let Some(cat_offset) = ctx.macho.addr_to_offset(cat_addr) {
-            fixed += fix_category_at(ctx, cat_offset)?;
-        }
-    }
-
-    Ok(fixed)
+    let types = if flags & METHOD_LIST_TYPE_OFFSETS_FLAG != 0 {
+        relative(
+            opts.ok_or_else(|| invalid("base-relative method types without selector base"))?
+                .selector_base,
+            4,
+        )?
+    } else if read_u32_le(&entry[4..]) == 0 {
+        0
+    } else {
+        relative(field + 4, 4)?
+    };
+    Ok((name, types, relative(field + 8, 8)?))
 }
 
-/// Fixes a single category's method lists.
-fn fix_category_at(ctx: &mut ExtractionContext, cat_offset: usize) -> Result<usize> {
-    // category_t structure:
-    // +0:  name (8 bytes)
-    // +8:  cls (8 bytes)
-    // +16: instanceMethods (8 bytes)
-    // +24: classMethods (8 bytes)
-    // +32: protocols (8 bytes)
-    // +40: instanceProperties (8 bytes)
-
-    if cat_offset + 48 > ctx.macho.data.len() {
-        return Ok(0);
-    }
-
-    let mut fixed = 0;
-
-    // Fix instance methods (optimized load)
-    let instance_methods = crate::util::read_u64_le(&ctx.macho.data[cat_offset + 16..]);
-
-    if instance_methods != 0 {
-        let addr = instance_methods & 0x0000_FFFF_FFFF_FFFF;
-        if let Some(offset) = ctx.macho.addr_to_offset(addr) {
-            fixed += fix_method_list(ctx, offset)?;
-        }
-    }
-
-    // Fix class methods (optimized load)
-    let class_methods = crate::util::read_u64_le(&ctx.macho.data[cat_offset + 24..]);
-
-    if class_methods != 0 {
-        let addr = class_methods & 0x0000_FFFF_FFFF_FFFF;
-        if let Some(offset) = ctx.macho.addr_to_offset(addr) {
-            fixed += fix_method_list(ctx, offset)?;
-        }
-    }
-
-    Ok(fixed)
+fn clean(pointer: u64) -> u64 {
+    pointer & 0x0000_ffff_ffff_ffff
 }
-
-/// Fixes a method_list_t structure.
-///
-/// Clears the DIRECT_SEL and UNIQUED flags from the method list header.
-fn fix_method_list(ctx: &mut ExtractionContext, offset: usize) -> Result<usize> {
-    // method_list_t structure:
-    // +0: entsize_and_flags (4 bytes) - contains size + flags in high bits
-    // +4: count (4 bytes)
-    // +8: methods[] - array of method entries
-
-    if offset + 8 > ctx.macho.data.len() {
-        return Ok(0);
-    }
-
-    // Read entsize_and_flags (optimized load)
-    let entsize_and_flags = crate::util::read_u32_le(&ctx.macho.data[offset..]);
-
-    // Check if method list has optimization flags that need clearing
-    let has_direct_sel = (entsize_and_flags & METHOD_LIST_DIRECT_SEL_FLAG) != 0;
-    let has_uniqued = (entsize_and_flags & METHOD_LIST_UNIQUED_FLAG) != 0;
-
-    if !has_direct_sel && !has_uniqued {
-        return Ok(0);
-    }
-
-    // Clear the direct selector and uniqued flags
-    // Keep the relative flag if present, and preserve entry size
-    let new_entsize_and_flags =
-        entsize_and_flags & !(METHOD_LIST_DIRECT_SEL_FLAG | METHOD_LIST_UNIQUED_FLAG);
-
-    ctx.macho.data[offset..offset + 4].copy_from_slice(&new_entsize_and_flags.to_le_bytes());
-
-    Ok(1)
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_flag_values() {
-        assert_eq!(OBJC_IMAGE_IS_SIMULATED, 0x01);
-        assert_eq!(OBJC_IMAGE_IS_REPLACEMENT, 0x02);
-        assert_eq!(OBJC_IMAGE_SUPPORTS_GC, 0x04);
-        assert_eq!(OBJC_IMAGE_OPTIMIZED_BY_DYLD, 0x08);
-        assert_eq!(OBJC_IMAGE_SIGNED_CLASS_RO, 0x10);
-    }
-
-    #[test]
-    fn test_method_list_flags() {
-        assert_eq!(METHOD_LIST_RELATIVE_FLAG, 0x8000_0000);
-        assert_eq!(METHOD_LIST_DIRECT_SEL_FLAG, 0x4000_0000);
-        assert_eq!(METHOD_LIST_UNIQUED_FLAG, 0x2000_0000);
-    }
-
-    #[test]
-    fn test_flag_clearing() {
-        let original: u32 = 0x6000_0018; // DIRECT_SEL + UNIQUED + some size
-        let expected: u32 = 0x0000_0018; // Just size
-        let result = original & !(METHOD_LIST_DIRECT_SEL_FLAG | METHOD_LIST_UNIQUED_FLAG);
-        assert_eq!(result, expected);
+fn invalid(reason: &str) -> Error {
+    Error::Parse {
+        offset: 0,
+        reason: reason.into(),
     }
 }

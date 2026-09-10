@@ -3,6 +3,7 @@
 //! Extract individual dylibs or all frameworks from Apple's dyld shared cache.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,6 +21,8 @@ use dylex::{
 
 /// Default locations to search for dyld shared caches on macOS.
 const DEFAULT_CACHE_PATHS: &[&str] = &[
+    // Discover native and both Rosetta products under their separate cryptexes.
+    "/System/Volumes/Preboot/Cryptexes",
     // macOS Ventura+ (cryptex)
     "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
     // Traditional location
@@ -264,38 +267,52 @@ fn discover_caches(dir: &Path) -> Result<Vec<CacheInfo>> {
         bail!("Path is not a directory: {}", dir.display());
     }
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Skip subcaches (.01, .02, .symbols, etc.)
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.contains('.') && !name.starts_with("dyld_shared_cache_") {
-            continue;
-        }
-
-        // Look for dyld_shared_cache_* files
-        if !name.starts_with("dyld_shared_cache_") {
-            continue;
-        }
-
-        // Skip subcache files (have extensions like .01, .02, .symbols)
-        if name.contains('.') {
-            continue;
-        }
-
-        // Try to parse the architecture from the filename
-        // Format: dyld_shared_cache_<arch> (e.g., dyld_shared_cache_arm64e)
-        if let Some(arch) = name.strip_prefix("dyld_shared_cache_") {
-            caches.push(CacheInfo {
-                path: path.clone(),
-                arch: arch.to_string(),
-            });
+    let mut pending = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let ty = entry.file_type()?;
+            // Bounded traversal; never follow directory symlinks into cycles.
+            if ty.is_dir() && depth < 8 {
+                // Staged updates and DriverKit caches are separate products.
+                // They remain usable when their directory/file is explicit.
+                if matches!(entry.file_name().to_str(), Some("Incoming" | "DriverKit")) {
+                    continue;
+                }
+                pending.push((path, depth + 1));
+                continue;
+            }
+            if !ty.is_file() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("dyld_shared_cache_") {
+                continue;
+            }
+            if name.contains('.') && !name.ends_with(".development") {
+                continue;
+            }
+            let mut magic = [0u8; 16];
+            if fs::File::open(&path)
+                .and_then(|mut f| f.read_exact(&mut magic))
+                .is_err()
+            {
+                continue;
+            }
+            if !(magic.starts_with(b"dyld_v0 ") || magic.starts_with(b"dyld_v1 ")) {
+                continue;
+            }
+            let arch = std::str::from_utf8(&magic[7..])
+                .unwrap_or("")
+                .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0')
+                .to_string();
+            if !arch.is_empty() {
+                caches.push(CacheInfo { path, arch });
+            }
         }
     }
-
-    // Sort by architecture name for consistent ordering
-    caches.sort_by(|a, b| a.arch.cmp(&b.arch));
+    caches.sort_by(|a, b| a.arch.cmp(&b.arch).then(a.path.cmp(&b.path)));
 
     Ok(caches)
 }
@@ -313,6 +330,21 @@ fn resolve_cache_path(path: &Path, arch: Option<&str>) -> Result<PathBuf> {
         bail!("Cache path does not exist: {}", path.display());
     }
 
+    // Preserve the historical no-argument native-cache default while exposing
+    // both Rosetta products to explicit architecture selection and `arches`.
+    if arch.is_none() && path == Path::new(DEFAULT_CACHE_PATHS[0]) {
+        let native_arches: &[&str] = match std::env::consts::ARCH {
+            "aarch64" => &["arm64e", "arm64"],
+            "x86_64" => &["x86_64h", "x86_64"],
+            _ => &[],
+        };
+        for native in native_arches {
+            let candidate = path.join(format!("OS/System/Library/dyld/dyld_shared_cache_{native}"));
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
     let caches = discover_caches(path)?;
 
     if caches.is_empty() {
@@ -339,10 +371,13 @@ fn resolve_cache_path(path: &Path, arch: Option<&str>) -> Result<PathBuf> {
     }
 
     if matching.len() > 1 {
-        let available: Vec<_> = matching.iter().map(|c| c.arch.as_str()).collect();
+        let available: Vec<_> = matching
+            .iter()
+            .map(|c| format!("{}: {}", c.arch, c.path.display()))
+            .collect();
         bail!(
-            "Multiple caches match. Please specify --arch. Available: {}",
-            available.join(", ")
+            "Multiple caches match. Specify --arch or an exact cache file path. Available:\n  {}",
+            available.join("\n  ")
         );
     }
 
@@ -694,6 +729,17 @@ fn cmd_info(cache: Option<PathBuf>, arch: Option<String>) -> Result<()> {
         cache.total_size() as f64 / 1024.0 / 1024.0
     );
 
+    if let Some(opts) = cache.objc_optimization()? {
+        println!("ObjC opts:    v{} at {:#x}", opts.version, opts.address);
+        println!("Selector base: {:#x}", opts.selector_base);
+        if let (Some(selectors), Some(types)) = (opts.selector_size, opts.types_size) {
+            println!(
+                "ObjC strings: {} selector bytes, {} type bytes",
+                selectors, types
+            );
+        }
+    }
+
     println!("\nMappings:");
     for (i, mapping) in cache.mappings.iter().enumerate() {
         let prot = format!(
@@ -776,20 +822,64 @@ fn cmd_lookup(cache: Option<PathBuf>, arch: Option<String>, address_str: String)
     let address = u64::from_str_radix(address_str, 16)
         .with_context(|| format!("Invalid address: {}", address_str))?;
 
-    // Find which image contains this address
+    // Image headers are not contiguous ownership ranges: gaps may be stub
+    // islands and DATA mappings are interleaved across many source images.
     for img in cache.iter_images() {
-        // Check if address is within image's range
-        // This is a simplified check - ideally we'd check against segments
-        if address >= img.address {
-            // Check the next image to see if we're still in range
-            println!("Address {:#x} is in:", address);
+        let header = cache.image_header(img.address)?;
+        if let Some(segment) = header.segments().find(|s| {
+            s.name() != "__LINKEDIT"
+                && address >= s.command.vmaddr
+                && address - s.command.vmaddr < s.command.vmsize
+        }) {
+            println!("Address {address:#x} is in:");
             println!("  Image: {}", img.path);
-            println!("  Base:  {:#x}", img.address);
+            println!("  Segment: {}", segment.name());
+            println!("  Base: {:#x}", segment.command.vmaddr);
             return Ok(());
         }
     }
+    if let Some(mapping) = cache.mapping_for_addr(address) {
+        println!("Address {address:#x} is in a cache-owned mapping:");
+        println!(
+            "  Subcache: {}",
+            if mapping.subcache_index == 0 {
+                cache.path.display().to_string()
+            } else {
+                cache.subcaches[mapping.subcache_index - 1]
+                    .path
+                    .display()
+                    .to_string()
+            }
+        );
+        println!(
+            "  Mapping: {:#x}–{:#x}",
+            mapping.address,
+            mapping.address + mapping.size
+        );
+        if mapping.is_executable() && cache.architecture().starts_with("arm64") {
+            let size = (mapping.size - (address - mapping.address)).min(16) as usize;
+            if let Some(stub) =
+                dylex::converter::decode_cache_stub(cache.data_at_addr(address, size)?, address)
+            {
+                let target = if stub.indirect {
+                    cache.pointer_at(stub.target)?
+                } else {
+                    stub.target
+                };
+                println!("  Stub target: {target:#x}");
+                if let Some(selector) = stub.selector {
+                    let bytes = cache.cstring_at(selector)?;
+                    println!(
+                        "  Selector: {}",
+                        String::from_utf8_lossy(&bytes[..bytes.len() - 1])
+                    );
+                }
+            }
+        }
+    } else {
+        println!("Address {address:#x} not found in any cache mapping");
+    }
 
-    println!("Address {:#x} not found in any image", address);
     Ok(())
 }
 
@@ -802,5 +892,74 @@ fn format_size(size: u64) -> String {
         format!("{:.1}K", size as f64 / 1024.0)
     } else {
         format!("{}B", size)
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    fn cache(root: &Path, relative: &str, magic: &[u8]) -> PathBuf {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, magic).unwrap();
+        path
+    }
+    #[test]
+    fn separate_rosetta_products_remain_distinct_and_explicitly_selectable() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = cache(
+            dir.path(),
+            "Rosetta/System/Library/dyld/dyld_shared_cache_x86_64",
+            b"dyld_v1  x86_64\0",
+        );
+        let reduced = cache(
+            dir.path(),
+            "Rosetta/System/x86Support/System/Library/dyld/dyld_shared_cache_x86_64",
+            b"dyld_v1  x86_64\0",
+        );
+        let native = cache(
+            dir.path(),
+            "OS/System/Library/dyld/dyld_shared_cache_arm64e",
+            b"dyld_v1  arm64e\0",
+        );
+        cache(
+            dir.path(),
+            "OS/System/Library/dyld/dyld_shared_cache_arm64e.01",
+            b"dyld_v1  arm64e\0",
+        );
+        cache(
+            dir.path(),
+            "Incoming/OS/System/Library/dyld/dyld_shared_cache_arm64e",
+            b"dyld_v1  arm64e\0",
+        );
+        cache(
+            dir.path(),
+            "Rosetta/System/DriverKit/System/Library/dyld/dyld_shared_cache_x86_64",
+            b"dyld_v1  x86_64\0",
+        );
+        assert_eq!(discover_caches(dir.path()).unwrap().len(), 3);
+        assert_eq!(
+            resolve_cache_path(dir.path(), Some("arm64e")).unwrap(),
+            native
+        );
+        let error = resolve_cache_path(dir.path(), Some("x86"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(full.to_str().unwrap()));
+        assert!(error.contains(reduced.to_str().unwrap()));
+        assert_eq!(resolve_cache_path(&reduced, None).unwrap(), reduced);
+    }
+    #[test]
+    fn discovery_uses_magic_not_filename_and_ignores_invalid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        cache(
+            dir.path(),
+            "dyld_shared_cache_anyname",
+            b"dyld_v1  x86_64\0",
+        );
+        cache(dir.path(), "dyld_shared_cache_invalid", b"not a cache");
+        let caches = discover_caches(dir.path()).unwrap();
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].arch, "x86_64");
     }
 }

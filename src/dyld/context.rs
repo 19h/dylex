@@ -252,6 +252,17 @@ impl DyldContext {
         // Load subcaches if present
         ctx.load_subcaches(&path)?;
 
+        // Files are not ordered by VM address in large caches.
+        ctx.mappings.sort_by_key(|m| m.address);
+        for pair in ctx.mappings.windows(2) {
+            if pair[0].address + pair[0].size > pair[1].address {
+                return Err(Error::Parse {
+                    offset: 0,
+                    reason: "overlapping cache VM mappings".into(),
+                });
+            }
+        }
+
         // Load symbols file if present
         ctx.load_symbols_file(&path)?;
 
@@ -266,31 +277,34 @@ impl DyldContext {
 
     /// Parses and validates the cache header.
     fn parse_header(data: &[u8]) -> Result<DyldCacheHeader> {
-        if data.len() < std::mem::size_of::<DyldCacheHeader>() {
+        // Only the fixed prefix is mandatory. Never interpret mapping bytes as
+        // newer fields when opening an older, shorter header.
+        if data.len() < 32 {
             return Err(Error::BufferTooSmall {
-                needed: std::mem::size_of::<DyldCacheHeader>(),
+                needed: 32,
                 available: data.len(),
             });
         }
-
-        let header = DyldCacheHeader::read_from_prefix(data)
+        let header_size = crate::util::read_u32_le(&data[16..]) as usize;
+        if header_size < 32 || header_size > data.len() {
+            return Err(Error::Parse {
+                offset: 16,
+                reason: "invalid cache header extent".into(),
+            });
+        }
+        let mut bytes = [0u8; std::mem::size_of::<DyldCacheHeader>()];
+        let copy_size = bytes.len().min(header_size);
+        bytes[..copy_size].copy_from_slice(&data[..copy_size]);
+        let header = DyldCacheHeader::read_from_prefix(&bytes)
             .map_err(|_| Error::Parse {
                 offset: 0,
-                reason: "failed to parse dyld cache header".into(),
+                reason: "invalid cache header".into(),
             })?
             .0;
-
-        // Validate magic
-        if &header.magic[..4] != DYLD_CACHE_MAGIC_PREFIX {
-            return Err(Error::InvalidMagic([
-                header.magic[0],
-                header.magic[1],
-                header.magic[2],
-                header.magic[3],
-            ]));
+        if !header.is_valid() {
+            return Err(Error::InvalidMagic(header.magic[..4].try_into().unwrap()));
         }
-
-        Ok(header.clone())
+        Ok(header)
     }
 
     /// Parses mapping entries from the cache.
@@ -299,16 +313,22 @@ impl DyldContext {
         header: &DyldCacheHeader,
         subcache_index: usize,
     ) -> Result<Vec<MappingEntry>> {
-        let mut mappings = Vec::with_capacity(header.mapping_count as usize);
+        let mut mappings = Vec::new();
 
         // Check if we have extended mapping info
-        let use_extended = header.contains_field(offset_of!(
-            super::DyldCacheHeader,
-            mapping_with_slide_offset
-        )) && header.mapping_with_slide_offset != 0;
+        let use_extended = header.contains_field_range(
+            offset_of!(super::DyldCacheHeader, mapping_with_slide_count),
+            4,
+        ) && header.mapping_with_slide_offset != 0;
 
         if use_extended {
             let offset = header.mapping_with_slide_offset as usize;
+            checked_table(
+                data,
+                offset,
+                header.mapping_with_slide_count as usize,
+                std::mem::size_of::<DyldCacheMappingAndSlideInfo>(),
+            )?;
             for i in 0..header.mapping_with_slide_count as usize {
                 let entry_offset = offset + i * std::mem::size_of::<DyldCacheMappingAndSlideInfo>();
                 let info = DyldCacheMappingAndSlideInfo::read_from_prefix(&data[entry_offset..])
@@ -321,6 +341,12 @@ impl DyldContext {
             }
         } else {
             let offset = header.mapping_offset as usize;
+            checked_table(
+                data,
+                offset,
+                header.mapping_count as usize,
+                std::mem::size_of::<DyldCacheMappingInfo>(),
+            )?;
             for i in 0..header.mapping_count as usize {
                 let entry_offset = offset + i * std::mem::size_of::<DyldCacheMappingInfo>();
                 let info = DyldCacheMappingInfo::read_from_prefix(&data[entry_offset..])
@@ -333,6 +359,28 @@ impl DyldContext {
             }
         }
 
+        if !use_extended
+            && header.contains_field_range(offset_of!(DyldCacheHeader, slide_info_size_unused), 8)
+            && header.slide_info_offset_unused != 0
+            && header.slide_info_size_unused != 0
+        {
+            if let Some(mapping) = mappings.iter_mut().find(|m| m.is_writable()) {
+                mapping.slide_info_offset = header.slide_info_offset_unused;
+                mapping.slide_info_size = header.slide_info_size_unused;
+            }
+        }
+        for m in &mappings {
+            if m.address.checked_add(m.size).is_none()
+                || m.file_offset
+                    .checked_add(m.size)
+                    .is_none_or(|end| end > data.len() as u64)
+            {
+                return Err(Error::Parse {
+                    offset: header.mapping_offset as usize,
+                    reason: "cache mapping out of bounds".into(),
+                });
+            }
+        }
         Ok(mappings)
     }
 
@@ -355,6 +403,7 @@ impl DyldContext {
             std::mem::size_of::<DyldSubcacheEntry>()
         };
 
+        checked_table(&self.mmap, offset, count, entry_size)?;
         for i in 0..count {
             let entry_offset = offset + i * entry_size;
 
@@ -380,6 +429,17 @@ impl DyldContext {
                 (entry.uuid, entry.cache_vm_offset, format!(".{}", i + 1))
             };
 
+            if !suffix.starts_with('.')
+                || suffix.contains('/')
+                || suffix.contains('\\')
+                || suffix == "."
+                || suffix == ".."
+            {
+                return Err(Error::Parse {
+                    offset: entry_offset,
+                    reason: "invalid subcache suffix".into(),
+                });
+            }
             // Load subcache file
             let subcache_path = parent_dir.join(format!("{}{}", main_name, suffix));
             self.load_subcache_file(&subcache_path, uuid, vm_offset, i + 1)?;
@@ -483,6 +543,12 @@ impl DyldContext {
         let count = self.header.actual_images_count() as usize;
         let offset = self.header.actual_images_offset() as usize;
 
+        checked_table(
+            &self.mmap,
+            offset,
+            count,
+            std::mem::size_of::<DyldCacheImageInfo>(),
+        )?;
         let mut images = Vec::with_capacity(count);
 
         for i in 0..count {
@@ -547,31 +613,17 @@ impl DyldContext {
             })?
             .0;
 
-        self.local_symbols_info = Some(info.clone());
+        self.local_symbols_info = Some(info);
         Ok(())
     }
 
     /// Checks if this cache uses v2 subcache entries.
     fn has_v2_subcache_entries(&self) -> bool {
-        // V2 entries have the file suffix embedded
-        // We detect this by checking if the structure would have a suffix field
-        // within bounds of the subcache array
-        if self.header.sub_cache_array_count == 0 {
-            return false;
-        }
-
-        // Check by trying to read a v2 entry and seeing if the suffix looks valid
-        let offset = self.header.sub_cache_array_offset as usize;
-        if offset + std::mem::size_of::<DyldSubcacheEntry2>() > self.mmap.len() {
-            return false;
-        }
-
-        if let Ok((entry, _)) = DyldSubcacheEntry2::read_from_prefix(&self.mmap[offset..]) {
-            // V2 entries have ASCII suffix starting with '.'
-            entry.file_suffix[0] == b'.'
-        } else {
-            false
-        }
+        // IDA fmt/dsc/shared_cache_file_t.cpp: the cacheSubType extension
+        // identifies suffix-bearing entries. Bytes in the next v1 entry are
+        // not a reliable discriminator.
+        self.header
+            .contains_field_range(offset_of!(DyldCacheHeader, cache_sub_type), 4)
     }
 
     /// Finds which subcache contains the given address.
@@ -651,9 +703,11 @@ impl DyldContext {
             if mapping.contains_addr(addr) {
                 let offset = mapping.addr_to_offset(addr) as usize;
                 let data = self.data_for_subcache(mapping.subcache_index);
-                if offset + len > data.len() {
+                if len as u64 > mapping.size - (addr - mapping.address)
+                    || offset.checked_add(len).is_none_or(|end| end > data.len())
+                {
                     return Err(Error::BufferTooSmall {
-                        needed: offset + len,
+                        needed: offset.saturating_add(len),
                         available: data.len(),
                     });
                 }
@@ -661,6 +715,25 @@ impl DyldContext {
             }
         }
         Err(Error::AddressNotFound { addr })
+    }
+
+    /// Copies a virtual range across adjacent mappings and subcache boundaries.
+    /// Gaps fail explicitly; unrelated bytes in the same file are never copied.
+    pub fn copy_data_at_addr(&self, mut addr: u64, mut output: &mut [u8]) -> Result<()> {
+        while !output.is_empty() {
+            let mapping = self
+                .mapping_for_addr(addr)
+                .ok_or(Error::AddressNotFound { addr })?;
+            let size = output
+                .len()
+                .min((mapping.size - (addr - mapping.address)) as usize);
+            output[..size].copy_from_slice(self.data_at_addr(addr, size)?);
+            addr = addr
+                .checked_add(size as u64)
+                .ok_or(Error::AddressNotFound { addr })?;
+            output = &mut output[size..];
+        }
+        Ok(())
     }
 
     /// Returns the mmap data for a given subcache index.
@@ -825,15 +898,15 @@ impl DyldContext {
                     }
                 }
                 3 => {
-                    // Slide info v3 has auth_value_add at offset 8
-                    if offset + 16 <= cache_data.len() {
-                        return Some(crate::util::read_u64_le(&cache_data[offset + 8..]));
+                    // Slide info v3 has auth_value_add at offset 16 (64-bit alignment)
+                    if offset + 24 <= cache_data.len() {
+                        return Some(crate::util::read_u64_le(&cache_data[offset + 16..]));
                     }
                 }
                 5 => {
-                    // Slide info v5 has value_add at offset 8
-                    if offset + 16 <= cache_data.len() {
-                        return Some(crate::util::read_u64_le(&cache_data[offset + 8..]));
+                    // Slide info v5 has value_add at offset 16 (64-bit alignment)
+                    if offset + 24 <= cache_data.len() {
+                        return Some(crate::util::read_u64_le(&cache_data[offset + 16..]));
                     }
                 }
                 _ => {}
@@ -842,6 +915,20 @@ impl DyldContext {
 
         None
     }
+}
+
+/// Validates a counted on-disk array before allocation or slicing.
+fn checked_table(data: &[u8], offset: usize, count: usize, stride: usize) -> Result<()> {
+    let end = count
+        .checked_mul(stride)
+        .and_then(|size| offset.checked_add(size));
+    if end.is_none_or(|end| end > data.len()) {
+        return Err(Error::Parse {
+            offset,
+            reason: "cache table out of bounds".into(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

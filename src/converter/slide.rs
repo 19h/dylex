@@ -1,519 +1,182 @@
-//! Slide info processing for pointer rebasing.
-//!
-//! In the dyld shared cache, pointers contain encoded information for ASLR.
-//! This module removes that encoding to produce normal pointers.
-//!
-//! There are multiple slide info versions:
-//! - V2: Standard arm64 (non-PAC)
-//! - V3: arm64e with pointer authentication
-//! - V5: arm64e (iOS 18+, macOS 14.4+)
-//!
-//! # Performance
-//!
-//! Page processing is parallelized using rayon for significant speedup on
-//! multi-core systems. Each page is independent and can be processed in parallel.
-
-use std::sync::Arc;
-
-use rayon::prelude::*;
-use tracing::{debug, trace};
-
-use crate::dyld::*;
-use crate::error::{Error, Result};
-use crate::macho::MachOContext;
-
+//! Decode slide chains from the source cache, including portions belonging to
+//! neighboring images on the same page. Only file-backed output slots are written.
 use super::ExtractionContext;
+use crate::dyld::{MappingEntry, SlidePointer3, SlidePointer5};
+use crate::util::{read_u32_le, read_u64_le};
+use crate::{Error, Result};
+use std::collections::BTreeSet;
 
-/// A single write operation to be applied to the Mach-O buffer.
-/// Collected during parallel processing, applied sequentially.
-#[derive(Clone, Copy)]
-struct WriteOp {
-    offset: usize,
-    value: u64,
-}
-
-/// Mapping info needed for slide processing.
-#[derive(Clone)]
-struct SlideMapping {
-    address: u64,
-    #[allow(dead_code)]
-    size: u64,
-    slide_info_offset: u64,
-    #[allow(dead_code)]
-    slide_info_size: u64,
-    subcache_index: usize,
-}
-
-/// Processes slide info for all mappings that overlap with the image.
+/// Removes v2/v3/v5 slide encoding from image pointers (including x86_64 v2).
+/// Each chain is bounded by its source page; malformed tables fail explicitly.
 pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
-    ctx.info("Processing slide info...");
-
-    // Clone the Arc to avoid borrow conflicts - this is cheap (just ref count bump)
-    let cache = Arc::clone(&ctx.cache);
-
-    // Collect mapping info we need
-    let mappings: Vec<SlideMapping> = cache
-        .mappings
-        .iter()
-        .filter(|m| m.has_slide_info())
-        .filter(|mapping| {
-            // Check if this mapping overlaps with any of our segments
-            ctx.macho.segments().any(|seg| {
-                let seg_start = seg.command.vmaddr;
-                let seg_end = seg_start + seg.command.vmsize;
-                let map_start = mapping.address;
-                let map_end = map_start + mapping.size;
-                seg_start < map_end && seg_end > map_start
-            })
-        })
-        .map(|m| SlideMapping {
-            address: m.address,
-            size: m.size,
-            slide_info_offset: m.slide_info_offset,
-            slide_info_size: m.slide_info_size,
-            subcache_index: m.subcache_index,
-        })
-        .collect();
-
-    for mapping in mappings {
-        // Get slide info data from the appropriate subcache
-        let cache_data = cache.data_for_subcache(mapping.subcache_index);
-        let slide_offset = mapping.slide_info_offset as usize;
-
-        if slide_offset + 4 > cache_data.len() {
-            ctx.warn(&format!(
-                "Slide info at offset {:#x} is out of bounds",
-                slide_offset
-            ));
-            continue;
+    let cache = std::sync::Arc::clone(&ctx.cache);
+    for mapping in cache.mappings.iter().filter(|m| m.has_slide_info()) {
+        let data = cache.data_for_subcache(mapping.subcache_index);
+        let off = usize::try_from(mapping.slide_info_offset)
+            .map_err(|_| invalid(mapping, "slide offset overflow"))?;
+        let end = off
+            .checked_add(mapping.slide_info_size as usize)
+            .filter(|e| *e <= data.len())
+            .ok_or_else(|| invalid(mapping, "slide table outside file"))?;
+        let slide = &data[off..end];
+        if slide.len() < 24 {
+            return Err(invalid(mapping, "truncated slide header"));
         }
-
-        // Read version (optimized: single unaligned load)
-        let version = crate::util::read_u32_le(&cache_data[slide_offset..]);
-
-        debug!(
-            "Processing slide info v{} for mapping at {:#x}",
-            version, mapping.address
-        );
-
-        match version {
-            2 => process_slide_info_v2(&mut ctx.macho, cache_data, slide_offset, &mapping)?,
-            3 => process_slide_info_v3(&mut ctx.macho, cache_data, slide_offset, &mapping)?,
-            5 => process_slide_info_v5(&mut ctx.macho, &cache, cache_data, slide_offset, &mapping)?,
+        let version = read_u32_le(slide);
+        let page_size = read_u32_le(&slide[4..]) as u64;
+        if page_size != 4096 && page_size != 16384 {
+            return Err(invalid(mapping, "unsupported slide page size"));
+        }
+        let (count, starts, extras, extras_count, mask, base) = match version {
+            2 if slide.len() >= 40 => (
+                read_u32_le(&slide[12..]) as usize,
+                read_u32_le(&slide[8..]) as usize,
+                read_u32_le(&slide[16..]) as usize,
+                read_u32_le(&slide[20..]) as usize,
+                read_u64_le(&slide[24..]),
+                read_u64_le(&slide[32..]),
+            ),
+            3 | 5 => (
+                read_u32_le(&slide[8..]) as usize,
+                24,
+                0,
+                0,
+                0,
+                read_u64_le(&slide[16..]),
+            ),
             _ => {
-                return Err(Error::UnsupportedSlideVersion(version));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Processes slide info version 2 (standard arm64 and x86_64).
-///
-/// For x86_64: Pointers are already in offset format with embedded delta chain.
-/// The extracted binary keeps this format - no rebasing needed.
-///
-/// For arm64 (non-PAC): Pointers need rebasing by adding value_add.
-///
-/// # Performance
-///
-/// Pages are processed in parallel using rayon. Each page's write operations
-/// are collected independently, then applied in a single pass.
-fn process_slide_info_v2(
-    macho: &mut MachOContext,
-    cache_data: &[u8],
-    offset: usize,
-    mapping: &SlideMapping,
-) -> Result<()> {
-    use zerocopy::FromBytes;
-
-    // For x86_64, pointers are already in the correct format (offset + delta).
-    // The extracted binary keeps this format for dyld to process at load time.
-    // No rebasing transformation is needed.
-    if macho.header.is_x86_64() {
-        debug!("Slide v2: skipping rebasing for x86_64 (pointers already in offset format)");
-        return Ok(());
-    }
-
-    let slide_info = DyldCacheSlideInfo2::read_from_prefix(&cache_data[offset..])
-        .map_err(|_| Error::InvalidSlideInfo {
-            offset: offset as u64,
-            reason: "failed to parse slide info v2".into(),
-        })?
-        .0;
-
-    let page_size = slide_info.page_size as u64;
-    let page_starts_offset = offset + slide_info.page_starts_offset as usize;
-    let page_count = slide_info.page_starts_count as usize;
-
-    let delta_mask = slide_info.delta_mask;
-    let value_mask = slide_info.value_mask();
-    let value_add = slide_info.value_add;
-    let delta_shift = slide_info.delta_shift();
-
-    debug!(
-        "Slide v2: delta_mask={:#018x}, value_mask={:#018x}, value_add={:#018x}, delta_shift={}, pages={}",
-        delta_mask, value_mask, value_add, delta_shift, page_count
-    );
-
-    // Collect page info for parallel processing
-    // Uses optimized u16 reads for better performance
-    let page_infos: Vec<_> = (0..page_count)
-        .filter_map(|page_idx| {
-            let page_start_offset = page_starts_offset + page_idx * 2;
-            if page_start_offset + 2 > cache_data.len() {
-                return None;
-            }
-            let page_start = crate::util::read_u16_le(&cache_data[page_start_offset..]);
-
-            // Skip pages with no rebasing needed
-            if page_start == (DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE & 0xFFFF) as u16 {
-                return None;
-            }
-
-            let page_addr = mapping.address + (page_idx as u64 * page_size);
-            let start_offset = (page_start as u64) * 4; // 32-bit jumps
-            Some((page_addr + start_offset, page_idx))
-        })
-        .collect();
-
-    // Process pages in parallel, collecting write operations
-    let macho_data: &[u8] = &macho.data;
-    let all_writes: Vec<Vec<WriteOp>> = page_infos
-        .par_iter()
-        .map(|&(start_addr, _page_idx)| {
-            collect_v2_page_writes(
-                macho_data,
-                macho,
-                start_addr,
-                delta_mask,
-                value_mask,
-                value_add,
-                delta_shift,
-            )
-        })
-        .collect();
-
-    // Apply all writes (sequential, but the heavy computation was parallel)
-    for writes in all_writes {
-        for op in writes {
-            macho.data[op.offset..op.offset + 8].copy_from_slice(&op.value.to_le_bytes());
-        }
-    }
-
-    Ok(())
-}
-
-/// Collects write operations for a v2 page without modifying the buffer.
-///
-/// # Performance
-///
-/// Uses optimized u64 reads that compile to single unaligned load instructions.
-#[inline]
-fn collect_v2_page_writes(
-    data: &[u8],
-    macho: &MachOContext,
-    mut addr: u64,
-    delta_mask: u64,
-    value_mask: u64,
-    value_add: u64,
-    delta_shift: u32,
-) -> Vec<WriteOp> {
-    let mut writes = Vec::with_capacity(64); // Pre-allocate for typical page
-
-    loop {
-        let macho_offset = match macho.addr_to_offset(addr) {
-            Some(off) => off,
-            None => {
-                trace!("Address {:#x} not in Mach-O, skipping", addr);
-                break;
+                return Err(invalid(
+                    mapping,
+                    &format!("unsupported slide version {version}"),
+                ));
             }
         };
-
-        if macho_offset + 8 > data.len() {
-            break;
-        }
-
-        // Optimized: single unaligned load instead of byte-by-byte
-        let raw_value = crate::util::read_u64_le(&data[macho_offset..]);
-
-        let delta = ((raw_value & delta_mask) >> delta_shift) as u64;
-
-        // Calculate new value: mask out delta bits and add base address
-        let mut new_value = raw_value & value_mask;
-        if new_value != 0 {
-            new_value += value_add;
-        }
-
-        writes.push(WriteOp {
-            offset: macho_offset,
-            value: new_value,
-        });
-
-        if delta == 0 {
-            break;
-        }
-        // Delta is in 4-byte units for v2
-        addr += delta * 4;
-    }
-
-    writes
-}
-
-// Note: rebase_v2_page removed - replaced by parallel collect_v2_page_writes
-
-/// Processes slide info version 3 (arm64e with PAC).
-///
-/// # Performance
-///
-/// Pages are processed in parallel using rayon.
-fn process_slide_info_v3(
-    macho: &mut MachOContext,
-    cache_data: &[u8],
-    offset: usize,
-    mapping: &SlideMapping,
-) -> Result<()> {
-    use zerocopy::FromBytes;
-
-    let slide_info = DyldCacheSlideInfo3::read_from_prefix(&cache_data[offset..])
-        .map_err(|_| Error::InvalidSlideInfo {
-            offset: offset as u64,
-            reason: "failed to parse slide info v3".into(),
-        })?
-        .0;
-
-    let page_size = slide_info.page_size as u64;
-    let auth_value_add = slide_info.auth_value_add;
-    let page_count = slide_info.page_starts_count as usize;
-
-    // Page starts immediately follow the header
-    let page_starts_offset = offset + std::mem::size_of::<DyldCacheSlideInfo3>();
-
-    debug!(
-        "Slide v3: auth_value_add={:#018x}, pages={}",
-        auth_value_add, page_count
-    );
-
-    // Collect page info for parallel processing (optimized u16 reads)
-    let page_infos: Vec<_> = (0..page_count)
-        .filter_map(|page_idx| {
-            let page_start_offset = page_starts_offset + page_idx * 2;
-            if page_start_offset + 2 > cache_data.len() {
-                return None;
-            }
-            let page_start = crate::util::read_u16_le(&cache_data[page_start_offset..]);
-
-            // Skip pages with no rebasing
-            if page_start == DYLD_CACHE_SLIDE_V3_PAGE_ATTR_NO_REBASE {
-                return None;
-            }
-
-            let page_addr = mapping.address + (page_idx as u64 * page_size);
-            let initial_offset = (page_start as u64) * 8; // 8-byte stride
-            Some(page_addr + initial_offset)
-        })
-        .collect();
-
-    // Process pages in parallel
-    let macho_data: &[u8] = &macho.data;
-    let all_writes: Vec<Vec<WriteOp>> = page_infos
-        .par_iter()
-        .map(|&start_addr| collect_v3_page_writes(macho_data, macho, start_addr, auth_value_add))
-        .collect();
-
-    // Apply all writes
-    for writes in all_writes {
-        for op in writes {
-            macho.data[op.offset..op.offset + 8].copy_from_slice(&op.value.to_le_bytes());
-        }
-    }
-
-    Ok(())
-}
-
-/// Collects write operations for a v3 page without modifying the buffer.
-///
-/// # Performance
-///
-/// Uses optimized u64 reads that compile to single unaligned load instructions.
-#[inline]
-fn collect_v3_page_writes(
-    data: &[u8],
-    macho: &MachOContext,
-    mut addr: u64,
-    auth_value_add: u64,
-) -> Vec<WriteOp> {
-    let mut writes = Vec::with_capacity(64);
-
-    loop {
-        let macho_offset = match macho.addr_to_offset(addr) {
-            Some(off) => off,
-            None => {
-                trace!("Address {:#x} not in Mach-O, skipping", addr);
-                break;
-            }
-        };
-
-        if macho_offset + 8 > data.len() {
-            break;
-        }
-
-        // Optimized: single unaligned load
-        let raw_value = crate::util::read_u64_le(&data[macho_offset..]);
-
-        let ptr = SlidePointer3(raw_value);
-        let delta = ptr.offset_to_next() * 8;
-
-        let new_value = if ptr.is_auth() {
-            // Authenticated pointer
-            ptr.auth_offset() as u64 + auth_value_add
+        let starts_data = table(slide, starts, count)
+            .ok_or_else(|| invalid(mapping, "page starts outside slide table"))?;
+        let extras_data = if extras_count == 0 {
+            &[][..]
         } else {
-            // Plain pointer with packed high bits
-            ptr.plain_value()
+            table(slide, extras, extras_count)
+                .ok_or_else(|| invalid(mapping, "page extras outside slide table"))?
         };
-
-        writes.push(WriteOp {
-            offset: macho_offset,
-            value: new_value,
-        });
-
-        if delta == 0 {
-            break;
+        if version == 2 && (mask == 0 || mask.trailing_zeros() < 2) {
+            return Err(invalid(mapping, "invalid v2 delta mask"));
         }
-        addr += delta;
-    }
-
-    writes
-}
-
-// Note: rebase_v3_page removed - replaced by parallel collect_v3_page_writes
-
-/// Processes slide info version 5 (arm64e iOS 18+).
-///
-/// # Performance
-///
-/// Pages are processed in parallel using rayon.
-fn process_slide_info_v5(
-    macho: &mut MachOContext,
-    cache: &Arc<DyldContext>,
-    cache_data: &[u8],
-    offset: usize,
-    mapping: &SlideMapping,
-) -> Result<()> {
-    use zerocopy::FromBytes;
-
-    let slide_info = DyldCacheSlideInfo5::read_from_prefix(&cache_data[offset..])
-        .map_err(|_| Error::InvalidSlideInfo {
-            offset: offset as u64,
-            reason: "failed to parse slide info v5".into(),
-        })?
-        .0;
-
-    let page_size = slide_info.page_size as u64;
-    let value_add = slide_info.value_add;
-    let page_count = slide_info.page_starts_count as usize;
-
-    // Page starts immediately follow the header
-    let page_starts_offset = offset + std::mem::size_of::<DyldCacheSlideInfo5>();
-
-    debug!(
-        "Slide v5: value_add={:#018x}, pages={}",
-        value_add, page_count
-    );
-
-    // Collect page info for parallel processing (optimized u16 reads)
-    let page_infos: Vec<_> = (0..page_count)
-        .filter_map(|page_idx| {
-            let page_start_offset = page_starts_offset + page_idx * 2;
-            if page_start_offset + 2 > cache_data.len() {
-                return None;
+        // Examine only pages intersecting file-backed image segments. A chain
+        // can begin in a neighboring image, so traversal still starts at the
+        // page's recorded chain head and reads the unmodified cache bytes.
+        let mut pages = BTreeSet::new();
+        for seg in ctx.macho.segments() {
+            let start = seg.command.vmaddr.max(mapping.address);
+            let end =
+                (seg.command.vmaddr + seg.command.filesize).min(mapping.address + mapping.size);
+            if start < end {
+                for page in
+                    (start - mapping.address) / page_size..=(end - 1 - mapping.address) / page_size
+                {
+                    if page >= count as u64 {
+                        return Err(invalid(mapping, "mapping page missing from slide table"));
+                    }
+                    pages.insert(page as usize);
+                }
             }
-            let page_start = crate::util::read_u16_le(&cache_data[page_start_offset..]);
-
-            // Skip pages with no rebasing
-            if page_start == DYLD_CACHE_SLIDE_V5_PAGE_ATTR_NO_REBASE {
-                return None;
+        }
+        for page in pages {
+            let value = u16::from_le_bytes(starts_data[page * 2..page * 2 + 2].try_into().unwrap());
+            let mut heads = Vec::new();
+            if version == 2 {
+                if value == 0x4000 {
+                    continue;
+                }
+                if value & 0x8000 != 0 {
+                    let mut index = (value & 0x3fff) as usize;
+                    loop {
+                        let b = extras_data
+                            .get(index * 2..index * 2 + 2)
+                            .ok_or_else(|| invalid(mapping, "unterminated v2 page extras"))?;
+                        let entry = u16::from_le_bytes(b.try_into().unwrap());
+                        heads.push((entry & 0x3fff) as u64 * 4);
+                        if entry & 0x8000 != 0 {
+                            break;
+                        }
+                        index += 1;
+                    }
+                } else {
+                    heads.push(value as u64 * 4);
+                }
+            } else {
+                if value == 0xffff {
+                    continue;
+                }
+                heads.push(value as u64);
             }
-
-            let page_addr = mapping.address + (page_idx as u64 * page_size);
-            let initial_offset = (page_start as u64) * 8;
-            Some(page_addr + initial_offset)
-        })
-        .collect();
-
-    // Process pages in parallel
-    // We need the cache (to follow delta chains through other images' regions)
-    // and macho (to write rebased values)
-    let all_writes: Vec<Vec<WriteOp>> = page_infos
-        .par_iter()
-        .map(|&start_addr| collect_v5_page_writes(cache, macho, start_addr, value_add))
-        .collect();
-
-    // Apply all writes
-    for writes in all_writes {
-        for op in writes {
-            macho.data[op.offset..op.offset + 8].copy_from_slice(&op.value.to_le_bytes());
+            let page_start = mapping.address + page as u64 * page_size;
+            let page_end = (page_start + page_size).min(mapping.address + mapping.size);
+            for start in heads {
+                let mut addr = page_start + start;
+                loop {
+                    if addr.checked_add(8).is_none_or(|end| end > page_end) {
+                        return Err(invalid(mapping, "slide chain leaves page"));
+                    }
+                    let raw = read_u64_le(cache.data_at_addr(addr, 8)?);
+                    let (value, delta) = match version {
+                        2 => {
+                            let raw_value = raw & !mask;
+                            let value = if raw_value == 0 {
+                                0
+                            } else {
+                                raw_value
+                                    .checked_add(base)
+                                    .ok_or_else(|| invalid(mapping, "v2 pointer overflow"))?
+                            };
+                            (value, ((raw & mask) >> mask.trailing_zeros()) * 4)
+                        }
+                        3 => {
+                            let p = SlidePointer3(raw);
+                            let value = if p.is_auth() {
+                                base.checked_add(p.auth_offset() as u64)
+                                    .ok_or_else(|| invalid(mapping, "v3 pointer overflow"))?
+                            } else {
+                                p.plain_value()
+                            };
+                            (value, p.offset_to_next() * 8)
+                        }
+                        5 => {
+                            let p = SlidePointer5(raw);
+                            let mut value = base
+                                .checked_add(p.runtime_offset())
+                                .ok_or_else(|| invalid(mapping, "v5 pointer overflow"))?;
+                            if !p.is_auth() {
+                                value |= (p.high8() as u64) << 56;
+                            }
+                            (value, p.next() * 8)
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Some(offset) = ctx.macho.addr_to_offset(addr) {
+                        if ctx.macho.addr_to_offset(addr + 7) == Some(offset + 7) {
+                            ctx.macho.write_u64(offset, value)?;
+                        }
+                    }
+                    if delta == 0 {
+                        break;
+                    }
+                    addr = addr
+                        .checked_add(delta)
+                        .ok_or_else(|| invalid(mapping, "slide chain address overflow"))?;
+                }
+            }
         }
     }
-
     Ok(())
 }
 
-/// Collects write operations for a v5 page without modifying the buffer.
-///
-/// IMPORTANT: We read the delta chain from the cache (which covers all images),
-/// but only generate WriteOps for addresses that are in our macho's segments.
-/// This handles the case where a page contains data from multiple images - we follow
-/// the delta chain through other images' data to find our pointers.
-#[inline]
-fn collect_v5_page_writes(
-    cache: &Arc<DyldContext>,
-    macho: &MachOContext,
-    mut addr: u64,
-    value_add: u64,
-) -> Vec<WriteOp> {
-    let mut writes = Vec::with_capacity(64);
-
-    loop {
-        // First check if this address is in our macho
-        let macho_offset = macho.addr_to_offset(addr);
-
-        // Read the raw value from the cache to follow the delta chain
-        // This works even for addresses not in our macho (other images' data)
-        let raw_value = match cache.data_at_addr(addr, 8) {
-            Ok(data) => u64::from_le_bytes(data.try_into().unwrap()),
-            Err(_) => {
-                break;
-            }
-        };
-
-        let ptr = SlidePointer5(raw_value);
-        let delta = ptr.next() * 8;
-
-        // Only write if this address is in our macho
-        if let Some(macho_off) = macho_offset {
-            let new_value = if ptr.is_auth() {
-                // Authenticated pointer
-                ptr.runtime_offset() + value_add
-            } else {
-                // Regular pointer with high8
-                let runtime_offset = ptr.runtime_offset();
-                let high8 = (ptr.high8() as u64) << 56;
-                runtime_offset + value_add + high8
-            };
-
-            writes.push(WriteOp {
-                offset: macho_off,
-                value: new_value,
-            });
-        }
-
-        if delta == 0 {
-            break;
-        }
-        addr += delta;
+fn table(data: &[u8], offset: usize, count: usize) -> Option<&[u8]> {
+    data.get(offset..offset.checked_add(count.checked_mul(2)?)?)
+}
+fn invalid(mapping: &MappingEntry, reason: &str) -> Error {
+    Error::InvalidSlideInfo {
+        offset: mapping.slide_info_offset,
+        reason: reason.into(),
     }
-
-    writes
 }

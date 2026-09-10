@@ -230,35 +230,24 @@ impl<'a> LinkeditOptimizer<'a> {
             return Ok(&[]);
         }
 
-        // LINKEDIT data is referenced by file offset in the original cache
-        // We need to read from the Mach-O data which was copied from the cache
-        let offset = offset as usize;
-        let size = size as usize;
-
-        if offset + size > self.ctx.macho.data.len() {
-            // Fall back to reading from cache if not in our buffer
-            let linkedit = self.ctx.macho.linkedit_segment().ok_or(Error::Parse {
-                offset: 0,
-                reason: "no LINKEDIT segment".into(),
+        let linkedit = self.ctx.macho.linkedit_segment().ok_or(Error::Parse {
+            offset: 0,
+            reason: "no LINKEDIT segment".into(),
+        })?;
+        let relative = (offset as u64)
+            .checked_sub(linkedit.command.fileoff)
+            .filter(|relative| {
+                relative
+                    .checked_add(size as u64)
+                    .is_some_and(|end| end <= linkedit.command.filesize)
+            })
+            .ok_or(Error::Parse {
+                offset: offset as usize,
+                reason: "LINKEDIT read outside segment".into(),
             })?;
-
-            let linkedit_addr = linkedit.command.vmaddr;
-            let linkedit_file_off = linkedit.command.fileoff as usize;
-
-            // Convert file offset to cache address
-            if offset >= linkedit_file_off {
-                let rel_offset = offset - linkedit_file_off;
-                let addr = linkedit_addr + rel_offset as u64;
-                return self.ctx.cache.data_at_addr(addr, size);
-            }
-
-            return Err(Error::BufferTooSmall {
-                needed: offset + size,
-                available: self.ctx.macho.data.len(),
-            });
-        }
-
-        Ok(&self.ctx.macho.data[offset..offset + size])
+        self.ctx
+            .cache
+            .data_at_addr(linkedit.command.vmaddr + relative, size as usize)
     }
 
     /// Copies binding info to the new LINKEDIT.
@@ -360,7 +349,17 @@ impl<'a> LinkeditOptimizer<'a> {
 
             // Read the symbol name
             let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
-            let name_data = self.read_linkedit_data(name_offset as u32, 4096)?;
+            let name_data = self.read_linkedit_data(
+                name_offset as u32,
+                symtab
+                    .strsize
+                    .checked_sub(nlist.n_strx)
+                    .ok_or(Error::Parse {
+                        offset: name_offset,
+                        reason: "symbol string index out of bounds".into(),
+                    })?
+                    .min(4096),
+            )?;
             let name = self.extract_string(name_data);
 
             // Map old index to new
@@ -586,7 +585,17 @@ impl<'a> LinkeditOptimizer<'a> {
 
             // Read the symbol name
             let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
-            let name_data = self.read_linkedit_data(name_offset as u32, 4096)?;
+            let name_data = self.read_linkedit_data(
+                name_offset as u32,
+                symtab
+                    .strsize
+                    .checked_sub(nlist.n_strx)
+                    .ok_or(Error::Parse {
+                        offset: name_offset,
+                        reason: "symbol string index out of bounds".into(),
+                    })?
+                    .min(4096),
+            )?;
             let name = self.extract_string(name_data);
 
             // Map old index to new
@@ -637,7 +646,17 @@ impl<'a> LinkeditOptimizer<'a> {
 
             // Read the symbol name
             let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
-            let name_data = self.read_linkedit_data(name_offset as u32, 4096)?;
+            let name_data = self.read_linkedit_data(
+                name_offset as u32,
+                symtab
+                    .strsize
+                    .checked_sub(nlist.n_strx)
+                    .ok_or(Error::Parse {
+                        offset: name_offset,
+                        reason: "symbol string index out of bounds".into(),
+                    })?
+                    .min(4096),
+            )?;
             let name = self.extract_string(name_data);
 
             // Map old index to new
@@ -724,15 +743,7 @@ impl<'a> LinkeditOptimizer<'a> {
         for i in 0..indirect_count {
             let offset = indirect_start + i * 4;
 
-            if offset + 4 > self.ctx.macho.data.len() {
-                // Pad remaining entries with LOCAL
-                self.new_linkedit
-                    .extend_from_slice(&INDIRECT_SYMBOL_LOCAL.to_le_bytes());
-                continue;
-            }
-
-            // Optimized: single unaligned load
-            let sym_index = crate::util::read_u32_le(&self.ctx.macho.data[offset..]);
+            let sym_index = crate::util::read_u32_le(self.read_linkedit_data(offset as u32, 4)?);
 
             // Check for special marker values (these have high bits set)
             if sym_index == INDIRECT_SYMBOL_ABS
@@ -1041,5 +1052,6 @@ pub fn optimize_linkedit(ctx: &mut ExtractionContext) -> Result<()> {
     ctx.macho.data[linkedit_offset..linkedit_offset + new_linkedit.len()]
         .copy_from_slice(&new_linkedit);
 
+    ctx.macho.refresh()?;
     Ok(())
 }

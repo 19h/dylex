@@ -226,7 +226,7 @@ impl MachOContext {
                 if seg.command.vmsize > 0 {
                     self.segment_ranges.push(SegmentRange {
                         vmaddr: seg.command.vmaddr,
-                        vmsize: seg.command.vmsize,
+                        vmsize: seg.command.filesize,
                         fileoff: seg.command.fileoff,
                     });
                 }
@@ -234,6 +234,18 @@ impl MachOContext {
         }
         // Sort by vmaddr for binary search
         self.segment_ranges.sort_by_key(|r| r.vmaddr);
+    }
+
+    /// Rebuilds parsed commands and address indexes after changing raw commands.
+    pub fn refresh(&mut self) -> Result<()> {
+        self.header = MachHeader64::read_from_prefix(&self.data)
+            .map_err(|_| Error::InvalidMachoMagic(0))?
+            .0;
+        self.load_commands.clear();
+        self.segment_indices.clear();
+        self.parse_load_commands()?;
+        self.build_segment_ranges();
+        Ok(())
     }
 
     /// Creates a context from a slice within a dyld cache.
@@ -266,7 +278,10 @@ impl MachOContext {
                 })?
                 .0;
 
-            if offset + lc.cmdsize as usize > self.data.len() {
+            if lc.cmdsize < 8
+                || offset + lc.cmdsize as usize > end_offset
+                || offset + lc.cmdsize as usize > self.data.len()
+            {
                 return Err(Error::LoadCommandOverflow { offset });
             }
 
