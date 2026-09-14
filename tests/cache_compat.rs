@@ -802,3 +802,581 @@ fn live_cache_extraction_preserves_code_and_decodes_objc_roots() {
         images.len()
     );
 }
+
+fn selected_fixture() -> Vec<u8> {
+    let mut b = modern(0xa000);
+    for (i, path) in ["/usr/lib/Root", "/usr/lib/Target", "/usr/lib/Other"]
+        .iter()
+        .enumerate()
+    {
+        let off = 0x1000 + i * 0x2000;
+        let addr = BASE + off as u64;
+        image(&mut b, i, addr, path);
+        let symoff = 0x8000 + i as u32 * 0x100;
+        let stroff = 0x8400 + i as u32 * 0x100;
+        let indoff = 0x8700 + i as u32 * 16;
+        let funcoff = 0x8800 + i as u32 * 16;
+        let strings = format!("\0_function{i}\0_alias{i}\0_outside\0").into_bytes();
+        b[stroff as usize..stroff as usize + strings.len()].copy_from_slice(&strings);
+        for (j, n) in [
+            Nlist64 {
+                n_strx: 1,
+                n_type: N_SECT | N_EXT,
+                n_sect: 1,
+                n_desc: 0,
+                n_value: addr + 0x400,
+            },
+            Nlist64 {
+                n_strx: 12,
+                n_type: N_INDR | N_EXT,
+                n_sect: 0,
+                n_desc: 0,
+                n_value: 1,
+            },
+            Nlist64 {
+                n_strx: 20,
+                n_type: (if i == 1 { N_PBUD } else { N_UNDF }) | N_EXT,
+                n_sect: 0,
+                n_desc: 0x100,
+                n_value: 0,
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            put(&mut b, symoff as usize + j * 16, n);
+        }
+        u32at(&mut b, indoff as usize, 2);
+        b[funcoff as usize..funcoff as usize + 3].copy_from_slice(&[0x84, 0x08, 0]); // 0x404
+        let text = section(
+            "__text",
+            "__TEXT",
+            addr + 0x400,
+            off as u32 + 0x400,
+            16,
+            S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+        );
+        let got = section(
+            "__got",
+            "__TEXT",
+            addr + 0x600,
+            off as u32 + 0x600,
+            8,
+            S_NON_LAZY_SYMBOL_POINTERS,
+        );
+        let symtab = SymtabCommand {
+            cmd: LC_SYMTAB,
+            cmdsize: 24,
+            symoff,
+            nsyms: 3,
+            stroff,
+            strsize: strings.len() as u32,
+        };
+        let dysymtab = DysymtabCommand {
+            cmd: LC_DYSYMTAB,
+            cmdsize: 80,
+            nextdefsym: 2,
+            iundefsym: 2,
+            nundefsym: 1,
+            indirectsymoff: indoff,
+            nindirectsyms: 1,
+            ..Default::default()
+        };
+        let functions = LinkeditDataCommand {
+            cmd: LC_FUNCTION_STARTS,
+            cmdsize: 16,
+            dataoff: funcoff,
+            datasize: 3,
+        };
+        macho(
+            &mut b,
+            off,
+            vec![
+                segment("__TEXT", addr, off as u64, 0x800, &[text, got]),
+                segment("__LINKEDIT", BASE + 0x8000, 0x8000, 0x1000, &[]),
+                symtab.as_bytes().to_vec(),
+                dysymtab.as_bytes().to_vec(),
+                functions.as_bytes().to_vec(),
+            ],
+            CPU_TYPE_ARM64,
+        );
+        for j in 0..4 {
+            u32at(&mut b, off + 0x400 + j * 4, 0xd65f03c0);
+        }
+    }
+    u32at(
+        &mut b,
+        0x1400,
+        arm64::encode_bl(BASE + 0x1400, BASE + 0x7000),
+    );
+    u32at(
+        &mut b,
+        0x7000,
+        arm64::encode_adrp(16, BASE + 0x7000, BASE + 0x3400),
+    );
+    u32at(&mut b, 0x7004, arm64::encode_add_imm(16, 16, 0x400));
+    u32at(&mut b, 0x7008, arm64::encode_br(16));
+    b
+}
+
+#[test]
+fn lookup_resolves_cache_islands_and_reports_exact_or_nearest_symbols() {
+    let b = selected_fixture();
+    let (_dir, c) = open(&b);
+    assert!(c.address_owner(BASE + 0x7000).unwrap().is_none());
+    assert_eq!(
+        c.cache_stub_target(BASE + 0x7000).unwrap(),
+        Some((BASE + 0x3400, None))
+    );
+    let owner = c.address_owner(BASE + 0x3400).unwrap().unwrap();
+    assert_eq!(owner.image.path, "/usr/lib/Target");
+    assert_eq!(owner.symbol, Some(("_function1".into(), BASE + 0x3400)));
+    assert_eq!(
+        c.address_owner(BASE + 0x3404).unwrap().unwrap().symbol,
+        owner.symbol
+    );
+    assert!(c.address_owner(BASE + 0x8400).unwrap().is_none()); // shared LINKEDIT
+    assert!(c.address_owner(BASE + 0xa000).unwrap().is_none()); // exclusive end
+}
+
+#[test]
+fn explicit_merge_deduplicates_and_rejects_ambiguous_or_missing_images() {
+    let mut b = selected_fixture();
+    image(&mut b, 2, BASE + 0x5000, "/another/Target");
+    let (_dir, c) = open(&b);
+    assert!(
+        c.resolve_image("Target")
+            .unwrap_err()
+            .to_string()
+            .contains("/another/Target")
+    );
+    assert!(c.resolve_image("missing").is_err());
+    let paths = dylex::selected_merge_images(
+        &c,
+        "Root",
+        &[
+            "/usr/lib/Target".into(),
+            "Root".into(),
+            "/usr/lib/Target".into(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(paths, ["/usr/lib/Root", "/usr/lib/Target"]);
+}
+
+#[test]
+fn selected_merge_preserves_code_aliases_indirect_symbols_and_function_starts() {
+    let b = selected_fixture();
+    let (dir, c) = open(&b);
+    let path = dir.path().join("selected.macho");
+    dylex::extract_image_with_selected_images(&c, "Target", &["Root".into()], &path, 0).unwrap();
+    let m = MachOContext::new(&fs::read(path).unwrap(), 0).unwrap();
+    assert!(!m.contains_addr(BASE + 0x5400)); // unselected image
+    for start in [0x1400, 0x3400, 0x7000] {
+        let off = m.addr_to_offset(BASE + start).unwrap();
+        assert_eq!(
+            &m.data[off..off + 12],
+            &b[start as usize..start as usize + 12]
+        );
+    }
+    verify_merged_structure(&m);
+    let symtab = m
+        .load_commands
+        .iter()
+        .find_map(|lc| {
+            if let LoadCommandInfo::Symtab { command, .. } = lc {
+                Some(command)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let strings = &m.data[symtab.stroff as usize..(symtab.stroff + symtab.strsize) as usize];
+    let mut aliases = 0;
+    let mut starts = 0;
+    for raw in m.data[symtab.symoff as usize..symtab.symoff as usize + symtab.nsyms as usize * 16]
+        .chunks_exact(16)
+    {
+        if raw[4] & N_TYPE == N_INDR {
+            let offset = q(raw, 8) as usize;
+            assert!(strings[offset..].starts_with(b"_function"));
+            aliases += 1;
+        }
+        if matches!(q(raw,8), v if v == BASE+0x1404 || v == BASE+0x3404) {
+            starts += 1;
+        }
+    }
+    assert_eq!(aliases, 2);
+    assert_eq!(starts, 2);
+    let dysymtab = m
+        .load_commands
+        .iter()
+        .find_map(|lc| {
+            if let LoadCommandInfo::Dysymtab { command, .. } = lc {
+                Some(command)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    for seg in m.segments() {
+        for section in &seg.sections {
+            if section.name() != "__got" {
+                continue;
+            }
+            let index = d(
+                &m.data,
+                dysymtab.indirectsymoff as usize + section.section.reserved1 as usize * 4,
+            );
+            let off = symtab.symoff as usize + index as usize * 16;
+            assert_eq!(m.data[off + 4] & N_TYPE, N_UNDF);
+            let string = d(&m.data, off) as usize;
+            assert!(strings[string..].starts_with(b"_outside\0"));
+        }
+    }
+}
+
+fn verify_merged_structure(m: &MachOContext) {
+    let mut ranges = Vec::new();
+    let mut count = 0;
+    for seg in m.segments() {
+        let c = seg.command;
+        if c.vmsize != 0 {
+            ranges.push((c.vmaddr, c.vmaddr + c.vmsize));
+        }
+        assert!(c.fileoff + c.filesize <= m.data.len() as u64);
+        for s in &seg.sections {
+            count += 1;
+            assert!(
+                s.section.addr >= c.vmaddr
+                    && s.section.addr + s.section.size <= c.vmaddr + c.vmsize
+            );
+            if s.section.offset != 0 {
+                assert!((s.section.offset as u64) + s.section.size <= c.fileoff + c.filesize);
+            }
+        }
+    }
+    ranges.sort();
+    assert!(ranges.windows(2).all(|w| w[0].1 <= w[1].0));
+    for lc in &m.load_commands {
+        if let LoadCommandInfo::Symtab { command: c, .. } = lc {
+            let strings = &m.data[c.stroff as usize..(c.stroff + c.strsize) as usize];
+            for n in m.data[c.symoff as usize..c.symoff as usize + c.nsyms as usize * 16]
+                .chunks_exact(16)
+            {
+                assert!(n[5] as usize <= count);
+                assert!((d(n, 0) as usize) < strings.len());
+                assert!(strings[d(n, 0) as usize..].contains(&0));
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires live native cache; set DYLEX_TEST_CACHE"]
+fn live_selected_merge_preserves_geocore_and_both_screenshot_targets() {
+    let c = Arc::new(DyldContext::open(std::env::var("DYLEX_TEST_CACHE").unwrap()).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("geo-selected.macho");
+    let additions = ["libdispatch.dylib".into(), "libobjc.A.dylib".into()];
+    dylex::extract_image_with_selected_images(&c, "GeoServicesCore", &additions, &output, 0)
+        .unwrap();
+    let m = MachOContext::new(&fs::read(output).unwrap(), 0).unwrap();
+    verify_merged_structure(&m);
+    for path in dylex::selected_merge_images(&c, "GeoServicesCore", &additions).unwrap() {
+        let image = c.resolve_image(&path).unwrap();
+        for seg in c.image_header(image.address).unwrap().segments() {
+            for section in &seg.sections {
+                let s = &section.section;
+                if s.name() != "__text" || s.size == 0 {
+                    continue;
+                }
+                let off = m.addr_to_offset(s.addr).unwrap();
+                let mut original = vec![0; s.size as usize];
+                c.copy_data_at_addr(s.addr, &mut original).unwrap();
+                assert_eq!(
+                    &m.data[off..off + original.len()],
+                    original,
+                    "code differs: {path}"
+                );
+            }
+        }
+    }
+    for address in [0x2480895f0, 0x2480896b0] {
+        let target = c.cache_stub_target(address).unwrap().unwrap().0;
+        assert!(m.addr_to_offset(address).is_some());
+        assert!(m.addr_to_offset(target).is_some());
+    }
+}
+
+#[test]
+fn selected_merge_rejects_overlaps_and_malformed_symbol_indexes_before_writing() {
+    for failure in 0..3 {
+        let mut b = selected_fixture();
+        match failure {
+            0 => image(&mut b, 1, BASE + 0x1000, "/usr/lib/Target"),
+            1 => u64at(&mut b, 0x8018, u64::MAX), // N_INDR alias string index
+            _ => u32at(&mut b, 0x8700, 12345),    // indirect symbol index
+        }
+        let (dir, c) = open(&b);
+        let output = dir.path().join("invalid.macho");
+        assert!(
+            dylex::extract_image_with_selected_images(&c, "Root", &["Target".into()], &output, 0)
+                .is_err()
+        );
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn lookup_cli_follows_targets_and_terminates_cycles_and_long_chains() {
+    for mode in 0..3 {
+        let mut b = selected_fixture();
+        if mode != 0 {
+            let count = if mode == 1 { 2 } else { 65 };
+            for i in 0..count {
+                let off = 0x7000 + i * 16;
+                let target = BASE
+                    + if i + 1 == count {
+                        0x7000
+                    } else {
+                        off as u64 + 16
+                    };
+                u32at(
+                    &mut b,
+                    off,
+                    arm64::encode_adrp(16, BASE + off as u64, target),
+                );
+                u32at(
+                    &mut b,
+                    off + 4,
+                    arm64::encode_add_imm(16, 16, (target & 0xfff) as u32),
+                );
+                u32at(&mut b, off + 8, arm64::encode_br(16));
+            }
+        }
+        let (_dir, c) = open(&b);
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_dylex"))
+            .args(["lookup", &format!("{:#x}", BASE + 0x7000)])
+            .arg(&c.path)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        let stdout = String::from_utf8(result.stdout).unwrap();
+        match mode {
+            0 => {
+                assert!(stdout.contains("Image: /usr/lib/Target"));
+                assert!(stdout.contains("Symbol: _function1"));
+                assert!(stdout.contains("--merge-image '/usr/lib/Target'"));
+            }
+            1 => assert!(stdout.contains("stub cycle")),
+            _ => assert!(stdout.contains("exceeds 64 hops")),
+        }
+    }
+}
+
+fn runtime_fixture() -> Vec<u8> {
+    let mut b = selected_fixture();
+    image(
+        &mut b,
+        1,
+        BASE + 0x3000,
+        "/usr/lib/system/libdispatch.dylib",
+    );
+    image(
+        &mut b,
+        2,
+        BASE + 0x5000,
+        "/usr/lib/system/libsystem_c.dylib",
+    );
+    u32at(
+        &mut b,
+        0x3400,
+        arm64::encode_bl(BASE + 0x3400, BASE + 0x5400),
+    );
+    b
+}
+
+#[test]
+fn runtime_inference_uses_direct_reference_evidence_without_recursing() {
+    let b = runtime_fixture();
+    let (_dir, c) = open(&b);
+    let inferred = dylex::referenced_runtime_images(&c, &["Root".into()]).unwrap();
+    assert_eq!(inferred.len(), 1);
+    let target = &inferred[0];
+    assert_eq!(target.image_path, "/usr/lib/system/libdispatch.dylib");
+    assert_eq!(target.reference_count, 1);
+    assert_eq!(
+        (
+            target.source_address,
+            target.via_address,
+            target.target_address
+        ),
+        (BASE + 0x1400, BASE + 0x7000, BASE + 0x3400)
+    );
+    // Explicit additions are scan roots; automatically inferred ones are not.
+    let extra =
+        dylex::referenced_runtime_images(&c, &["Root".into(), "libdispatch.dylib".into()]).unwrap();
+    assert_eq!(extra.len(), 1);
+    assert_eq!(extra[0].image_path, "/usr/lib/system/libsystem_c.dylib");
+    assert_eq!(extra[0].source_address, BASE + 0x3400);
+}
+
+#[test]
+fn runtime_inference_counts_pointer_slots_and_excludes_arbitrary_frameworks() {
+    let mut b = runtime_fixture();
+    u64at(&mut b, 0x1600, BASE + 0x5400);
+    image(
+        &mut b,
+        1,
+        BASE + 0x3000,
+        "/System/Library/Frameworks/Example.framework/Example",
+    );
+    u32at(&mut b, offset_of!(DyldCacheHeader, images_count), 3);
+    let (_dir, c) = open(&b);
+    let inferred = dylex::referenced_runtime_images(&c, &["Root".into()]).unwrap();
+    assert_eq!(inferred.len(), 1);
+    assert_eq!(inferred[0].image_path, "/usr/lib/system/libsystem_c.dylib");
+    assert_eq!(inferred[0].source_address, BASE + 0x1600);
+    assert_eq!(inferred[0].reference_count, 1);
+}
+
+#[test]
+fn runtime_inference_excludes_data_in_code_and_follows_declared_local_stubs() {
+    for excluded in [false, true] {
+        let mut b = runtime_fixture();
+        // Turn the pointer section into a declared local branch stub.
+        let sectionoff = 0x1000 + 32 + 72 + 80;
+        put(
+            &mut b,
+            sectionoff,
+            &section(
+                "__stubs",
+                "__TEXT",
+                BASE + 0x1600,
+                0x1600,
+                4,
+                S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS,
+            ),
+        );
+        u32at(
+            &mut b,
+            0x1400,
+            arm64::encode_bl(BASE + 0x1400, BASE + 0x1600),
+        );
+        u32at(
+            &mut b,
+            0x1600,
+            arm64::encode_b(BASE + 0x1600, BASE + 0x3400),
+        );
+        if excluded {
+            // Mark both words as embedded data, despite instruction-section flags.
+            let cmd = LinkeditDataCommand {
+                cmd: LC_DATA_IN_CODE,
+                cmdsize: 16,
+                dataoff: 0x8900,
+                datasize: 16,
+            };
+            let off = 0x1000 + 32 + d(&b, 0x1000 + 20) as usize;
+            put(&mut b, off, &cmd);
+            let ncmds = d(&b, 0x1010);
+            let sizeofcmds = d(&b, 0x1014);
+            u32at(&mut b, 0x1010, ncmds + 1);
+            u32at(&mut b, 0x1014, sizeofcmds + 16);
+            for (i, address) in [0x1400u32, 0x1600].iter().enumerate() {
+                u32at(&mut b, 0x8900 + i * 8, *address);
+                b[0x8904 + i * 8..0x8906 + i * 8].copy_from_slice(&4u16.to_le_bytes());
+            }
+        }
+        let (_dir, c) = open(&b);
+        let inferred = dylex::referenced_runtime_images(&c, &["Root".into()]).unwrap();
+        if excluded {
+            assert!(inferred.is_empty());
+        } else {
+            assert_eq!(inferred.len(), 1);
+            assert_eq!(inferred[0].target_address, BASE + 0x3400);
+        }
+    }
+}
+
+#[test]
+fn merge_plan_prints_runtime_evidence_without_creating_output() {
+    let b = runtime_fixture();
+    let (dir, c) = open(&b);
+    let output = dir.path().join("must-not-exist.macho");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_dylex"))
+        .args([
+            "extract",
+            "-i",
+            "Root",
+            "--merge-runtime",
+            "--merge-plan",
+            "-o",
+        ])
+        .arg(&output)
+        .arg(&c.path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.exists());
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("Inferred 1 directly referenced runtime images"));
+    assert!(stdout.contains("libdispatch.dylib"));
+    assert!(!stdout.contains("libsystem_c.dylib"));
+    assert!(stdout.contains(&format!("{:#x}", BASE + 0x1400)));
+}
+
+#[test]
+#[ignore = "requires live native cache; set DYLEX_TEST_CACHE"]
+fn live_runtime_merge_preserves_all_inferred_images() {
+    let c = Arc::new(DyldContext::open(std::env::var("DYLEX_TEST_CACHE").unwrap()).unwrap());
+    let primary = c.resolve_image("GeoServicesCore").unwrap();
+    let inferred = dylex::referenced_runtime_images(&c, &[primary.path.clone()]).unwrap();
+    assert!(
+        inferred
+            .iter()
+            .any(|r| r.image_path == "/usr/lib/libobjc.A.dylib")
+    );
+    assert!(
+        inferred
+            .iter()
+            .any(|r| r.image_path == "/usr/lib/system/libdispatch.dylib")
+    );
+    let additions: Vec<_> = inferred.iter().map(|r| r.image_path.clone()).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("runtime.macho");
+    dylex::extract_image_with_selected_images(&c, &primary.path, &additions, &output, 0).unwrap();
+    let m = MachOContext::new(&fs::read(&output).unwrap(), 0).unwrap();
+    verify_merged_structure(&m);
+    for path in std::iter::once(&primary.path).chain(additions.iter()) {
+        let header = c
+            .image_header(c.resolve_image(path).unwrap().address)
+            .unwrap();
+        for s in header
+            .segments()
+            .flat_map(|s| &s.sections)
+            .filter(|s| s.name() == "__text" && s.section.size != 0)
+        {
+            let off = m.addr_to_offset(s.section.addr).unwrap();
+            let mut original = vec![0; s.section.size as usize];
+            c.copy_data_at_addr(s.section.addr, &mut original).unwrap();
+            assert_eq!(
+                &m.data[off..off + original.len()],
+                original,
+                "code differs: {path}"
+            );
+        }
+    }
+    for r in inferred {
+        assert!(m.addr_to_offset(r.target_address).is_some());
+    }
+    eprintln!(
+        "Verified {} inferred runtime images; {} byte output",
+        additions.len(),
+        fs::metadata(&output).unwrap().len()
+    );
+}

@@ -5,6 +5,8 @@ extraction pipeline. Outputs are Mach-O files for static analysis. They retain
 external function references and do not reconstruct a runnable operating-system
 loader environment. The existing experimental `--merge-deps` relocation pipeline
 is separate; its end-to-end behavior on Golden Gate is **unknown**.
+The subsequently added `--merge-image` mode preserves source addresses; see
+[selected-merge validation](selected-merge.md).
 
 ## Observed inputs
 

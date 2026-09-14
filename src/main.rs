@@ -84,9 +84,24 @@ enum Commands {
         deps_depth: Option<usize>,
 
         /// Merge dependencies into a single output binary
-        /// This creates a self-contained dylib with all referenced code/data inlined
+        /// Experimental relocation pipeline; use --merge-image for selected images at cache addresses
         #[arg(long)]
         merge_deps: bool,
+
+        /// Merge only these additional images (repeatable; full path, basename, or unique substring)
+        /// Includes the primary image, without traversing dependency lists
+        #[arg(long = "merge-image", requires = "image", conflicts_with_all = ["merge_deps", "with_deps", "filter", "merge_depth"])]
+        merge_images: Vec<String>,
+
+        /// Infer and merge directly referenced system/ObjC/C++/Swift runtime libraries
+        /// Scans the primary and explicit additions; does not recurse into inferred images
+        #[arg(long, requires = "image", conflicts_with_all = ["merge_deps", "with_deps", "filter", "merge_depth"])]
+        merge_runtime: bool,
+
+        /// Print the selected merge plan and reference evidence without writing output
+        /// Requires --merge-runtime or --merge-image
+        #[arg(long, requires = "image", conflicts_with_all = ["merge_deps", "with_deps", "filter", "merge_depth"])]
+        merge_plan: bool,
 
         /// Maximum depth for dependency merging (default: 1 = direct dependencies only)
         /// Only used with --merge-deps
@@ -179,6 +194,9 @@ fn main() -> Result<()> {
             with_deps,
             deps_depth,
             merge_deps,
+            merge_images,
+            merge_runtime,
+            merge_plan,
             merge_depth,
         } => {
             setup_logging(verbosity);
@@ -194,6 +212,9 @@ fn main() -> Result<()> {
                 with_deps,
                 deps_depth,
                 merge_deps,
+                merge_images,
+                merge_runtime,
+                merge_plan,
                 merge_depth,
             )
         }
@@ -409,9 +430,15 @@ fn cmd_extract(
     with_deps: bool,
     deps_depth: Option<usize>,
     merge_deps: bool,
+    merge_images: Vec<String>,
+    merge_runtime: bool,
+    merge_plan: bool,
     merge_depth: usize,
 ) -> Result<()> {
     let start = Instant::now();
+    if merge_plan && !merge_runtime && merge_images.is_empty() {
+        anyhow::bail!("--merge-plan requires --merge-runtime or --merge-image");
+    }
 
     // Get cache path (use default if not specified)
     let cache_path = get_cache_path(cache)?;
@@ -424,6 +451,55 @@ fn cmd_extract(
         DyldContext::open(&resolved_path)
             .with_context(|| format!("Failed to open cache: {}", resolved_path.display()))?,
     );
+
+    if merge_runtime || !merge_images.is_empty() {
+        let primary =
+            cache.resolve_image(image.as_deref().context("--merge-image requires --image")?)?;
+        let mut paths = dylex::selected_merge_images(&cache, &primary.path, &merge_images)?;
+        if merge_runtime {
+            let inferred = dylex::referenced_runtime_images(&cache, &paths)?;
+            println!(
+                "Inferred {} directly referenced runtime images:",
+                inferred.len()
+            );
+            for candidate in inferred {
+                println!(
+                    "  {} (reference sites: {})",
+                    candidate.image_path, candidate.reference_count
+                );
+                println!(
+                    "    {} at {:#x} -> {:#x} -> {:#x}",
+                    candidate.source_image,
+                    candidate.source_address,
+                    candidate.via_address,
+                    candidate.target_address
+                );
+                paths.push(candidate.image_path);
+            }
+        }
+        let output_path =
+            output.unwrap_or_else(|| PathBuf::from(format!("{}.merged", primary.basename())));
+        println!("Merging {} selected images:", paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            println!("  [{index}] {path}");
+        }
+        if merge_plan {
+            return Ok(());
+        }
+        dylex::extract_image_with_selected_images(
+            &cache,
+            &primary.path,
+            &paths[1..],
+            &output_path,
+            verbosity,
+        )?;
+        println!(
+            "Wrote {} ({:.2} s)",
+            output_path.display(),
+            start.elapsed().as_secs_f64()
+        );
+        return Ok(());
+    }
 
     // Handle merge mode - single image only
     if merge_deps {
@@ -822,65 +898,70 @@ fn cmd_lookup(cache: Option<PathBuf>, arch: Option<String>, address_str: String)
     let address = u64::from_str_radix(address_str, 16)
         .with_context(|| format!("Invalid address: {}", address_str))?;
 
-    // Image headers are not contiguous ownership ranges: gaps may be stub
-    // islands and DATA mappings are interleaved across many source images.
-    for img in cache.iter_images() {
-        let header = cache.image_header(img.address)?;
-        if let Some(segment) = header.segments().find(|s| {
-            s.name() != "__LINKEDIT"
-                && address >= s.command.vmaddr
-                && address - s.command.vmaddr < s.command.vmsize
-        }) {
-            println!("Address {address:#x} is in:");
-            println!("  Image: {}", img.path);
-            println!("  Segment: {}", segment.name());
-            println!("  Base: {:#x}", segment.command.vmaddr);
+    let mut current = address;
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..64 {
+        if !visited.insert(current) {
+            println!("  Resolution stopped: stub cycle at {current:#x}");
             return Ok(());
         }
-    }
-    if let Some(mapping) = cache.mapping_for_addr(address) {
-        println!("Address {address:#x} is in a cache-owned mapping:");
-        println!(
-            "  Subcache: {}",
-            if mapping.subcache_index == 0 {
-                cache.path.display().to_string()
-            } else {
-                cache.subcaches[mapping.subcache_index - 1]
-                    .path
-                    .display()
-                    .to_string()
+        if let Some(owner) = cache.address_owner(current)? {
+            println!("Address {current:#x} is in:");
+            println!("  Image: {}", owner.image.path);
+            println!("  Segment: {}", owner.segment);
+            println!("  Base: {:#x}", owner.base);
+            match owner.symbol {
+                Some((name, value)) if value == current => println!("  Symbol: {name}"),
+                Some((name, value)) => println!(
+                    "  Nearest symbol: {name} + {:#x} (symbol extent unknown)",
+                    current - value
+                ),
+                None => println!("  Symbol: unknown"),
             }
-        );
+            println!(
+                "  Extract: dylex extract -i {} {}",
+                shell_quote(&owner.image.path),
+                shell_quote(&cache.path.to_string_lossy())
+            );
+            println!(
+                "  Merge option: --merge-image {}",
+                shell_quote(&owner.image.path)
+            );
+            return Ok(());
+        }
+        let Some(mapping) = cache.mapping_for_addr(current) else {
+            println!("Address {current:#x} not found in any cache mapping");
+            return Ok(());
+        };
+        println!("Address {current:#x} is in a cache-owned mapping:");
+        let path = if mapping.subcache_index == 0 {
+            &cache.path
+        } else {
+            &cache.subcaches[mapping.subcache_index - 1].path
+        };
+        println!("  Subcache: {}", path.display());
         println!(
             "  Mapping: {:#x}–{:#x}",
             mapping.address,
             mapping.address + mapping.size
         );
-        if mapping.is_executable() && cache.architecture().starts_with("arm64") {
-            let size = (mapping.size - (address - mapping.address)).min(16) as usize;
-            if let Some(stub) =
-                dylex::converter::decode_cache_stub(cache.data_at_addr(address, size)?, address)
-            {
-                let target = if stub.indirect {
-                    cache.pointer_at(stub.target)?
-                } else {
-                    stub.target
-                };
-                println!("  Stub target: {target:#x}");
-                if let Some(selector) = stub.selector {
-                    let bytes = cache.cstring_at(selector)?;
-                    println!(
-                        "  Selector: {}",
-                        String::from_utf8_lossy(&bytes[..bytes.len() - 1])
-                    );
-                }
-            }
+        let Some((target, selector)) = cache.cache_stub_target(current)? else {
+            println!("  Image: none; no recognized stub target");
+            return Ok(());
+        };
+        println!("  Stub target: {target:#x}");
+        if let Some(selector) = selector {
+            println!("  Selector: {selector}");
         }
-    } else {
-        println!("Address {address:#x} not found in any cache mapping");
+        current = target;
     }
+    println!("  Resolution stopped: stub chain exceeds 64 hops");
 
     Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn format_size(size: u64) -> String {
@@ -961,5 +1042,77 @@ mod discovery_tests {
         let caches = discover_caches(dir.path()).unwrap();
         assert_eq!(caches.len(), 1);
         assert_eq!(caches[0].arch, "x86_64");
+    }
+}
+
+#[cfg(test)]
+mod selection_cli_tests {
+    use super::*;
+    #[test]
+    fn runtime_merge_accepts_explicit_additions_and_a_plan_but_not_recursive_modes() {
+        assert!(
+            Cli::try_parse_from([
+                "dylex",
+                "extract",
+                "-i",
+                "Root",
+                "--merge-runtime",
+                "--merge-image",
+                "Example",
+                "--merge-plan"
+            ])
+            .is_ok()
+        );
+        for flag in ["--merge-deps", "--with-deps"] {
+            assert!(
+                Cli::try_parse_from(["dylex", "extract", "-i", "Root", "--merge-runtime", flag])
+                    .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["dylex", "extract", "--merge-runtime"]).is_err());
+    }
+    #[test]
+    fn explicit_merge_flags_are_repeatable_and_conflicting_modes_are_rejected() {
+        assert!(
+            Cli::try_parse_from([
+                "dylex",
+                "extract",
+                "-i",
+                "Root",
+                "--merge-image",
+                "A",
+                "--merge-image",
+                "B"
+            ])
+            .is_ok()
+        );
+        for extra in ["--merge-deps", "--with-deps"] {
+            assert!(
+                Cli::try_parse_from([
+                    "dylex",
+                    "extract",
+                    "-i",
+                    "Root",
+                    "--merge-image",
+                    "A",
+                    extra
+                ])
+                .is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["dylex", "extract", "--merge-image", "A"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "dylex",
+                "extract",
+                "-i",
+                "Root",
+                "--merge-image",
+                "A",
+                "--merge-depth",
+                "2"
+            ])
+            .is_err()
+        );
     }
 }

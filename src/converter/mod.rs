@@ -21,6 +21,8 @@ mod linkedit;
 mod materialize;
 pub mod merger;
 mod objc;
+mod runtime;
+mod selected;
 mod slide;
 mod stub;
 mod support;
@@ -40,3 +42,7 @@ pub use slide::*;
 pub use stub::*;
 pub use support::include_cache_support;
 pub use writer::*;
+
+pub use selected::{extract_image_with_selected_images, selected_merge_images};
+
+pub use runtime::{RuntimeImageReference, is_runtime_image, referenced_runtime_images};

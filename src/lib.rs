@@ -43,6 +43,10 @@ pub mod macho;
 pub mod util;
 
 // Re-export main types
+pub use converter::{
+    RuntimeImageReference, extract_image_with_selected_images, referenced_runtime_images,
+    selected_merge_images,
+};
 pub use dyld::{DyldContext, ImageEntry, MappingEntry};
 pub use error::{Error, Result};
 pub use macho::MachOContext;

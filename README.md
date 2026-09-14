@@ -77,6 +77,11 @@ Options:
   -f, --filter <FILTER>         Filter images by substring match
   -a, --arch <ARCH>             Architecture (arm64e, arm64, x86_64)
   -o, --output <OUTPUT>         Output path (file or directory)
+      --merge-image <IMAGE>    Merge a selected additional image (repeatable)
+      --merge-runtime          Merge directly referenced runtime libraries
+      --merge-plan             Preview merge selection and reference evidence
+      --merge-deps             Experimental automatic dependency merge
+      --merge-depth <N>        Depth for --merge-deps [default: 1]
       --preserve-paths <BOOL>   Preserve directory structure [default: auto]
   -v, --verbosity <LEVEL>       Verbosity (0=quiet, 1=warn, 2=info, 3=debug)
   -j, --jobs <N>                Parallel jobs (default: CPU count)
@@ -104,6 +109,64 @@ dylex extract -a arm64e -i CoreFoundation -v 2
 # Use custom cache path
 dylex extract -a arm64e -i libobjc.A.dylib /path/to/dyld_shared_cache_arm64e
 ```
+
+### Merge referenced runtime libraries
+
+```bash
+# Inspect which runtime images are referenced and where
+dylex extract -i GeoServicesCore --merge-runtime --merge-plan
+
+# Merge the inferred runtime set
+dylex extract -i GeoServicesCore --merge-runtime
+
+# Add an explicit framework to the roots used for runtime inference
+dylex extract -i GeoServicesCore --merge-runtime --merge-image GeoServices
+```
+
+`--merge-runtime` selects directly referenced libraries in `/usr/lib/system/`,
+Objective-C, libc++, libc++abi, libSystem, and `/usr/lib/swift/libswift*.dylib`.
+It scans ARM64 direct branches and declared pointer sections, resolves recognized
+stubs, and reports reference counts with an example source/target chain for each
+inferred image. The primary and explicit additions are scan roots. Inferred
+libraries are not scanned recursively; dependency lists do not drive selection.
+Frameworks and other libraries remain explicit additions.
+
+`--merge-plan` writes no output. Computed calls without static pointer evidence
+are unknown; x86 inference uses pointer sections rather than instruction decoding.
+On the tested cache, GeoServicesCore selects ten runtime libraries. Empty section
+markers left by cache optimization are omitted unless a symbol references them;
+all retained section ordinals are remapped. This allows its 271 source section
+records to fit as 226 retained sections without removing populated sections.
+
+### Merge selected images
+
+Use `--merge-image` once per additional image. This selects the primary image
+and the listed images without traversing their dependency lists:
+
+```bash
+dylex extract -i GeoServicesCore \
+  --merge-image libdispatch.dylib \
+  --merge-image libobjc.A.dylib \
+  -o GeoServicesCore.selected
+```
+
+Image selection prefers a full path, then an exact basename, then a unique
+substring. Ambiguous names produce an error listing candidate paths. Repeated
+images are included once, and the command prints the canonical selection.
+`--merge-image` and `--merge-runtime` cannot be combined with `--merge-deps`, `--merge-depth`,
+`--with-deps`, or `--filter`.
+
+The output keeps source virtual addresses and instruction bytes. It combines
+sections, symbols, indirect-symbol tables, and function-start labels; referenced
+cache trampolines/dispatchers and Objective-C metadata are restored for the
+combined image. Those support regions can make output substantially larger than
+the selected images' own segments. External targets outside the selection can
+remain unmapped. These outputs are for static analysis; runtime loading is not
+supported. Open the newly extracted file in a fresh IDA database.
+
+See [selected-merge validation](docs/selected-merge.md) for tested behavior and
+format limits. The automatic `--merge-deps` mode retains its older experimental
+relocation pipeline.
 
 ### `dylex list`
 
@@ -191,7 +254,23 @@ Available architectures in /System/Volumes/Preboot/Cryptexes/OS/System/Library/d
 
 ### `dylex lookup`
 
-Find which image contains a specific address.
+Find which image contains a specific unslid cache address. Cache-owned ARM64
+stub islands are followed to their target image (up to 64 hops, with cycle
+detection). Output includes the image path, segment, exact symbol or nearest
+preceding symbol, an extraction command using the same cache, and a
+`--merge-image` option. A nearest symbol does not establish function extent.
+
+For the cache used in this validation:
+
+```text
+0x2480895f0 → 0x1806cf570 → /usr/lib/system/libdispatch.dylib
+Symbol: _dispatch_once
+
+0x2480896b0 → 0x180410d48 → /usr/lib/libobjc.A.dylib
+Symbol: _objc_retainAutoreleaseReturnValue
+```
+
+Addresses vary between cache builds.
 
 ```
 Usage: dylex lookup [OPTIONS] <ADDRESS> [CACHE]
@@ -335,7 +414,7 @@ Typical extraction times on Apple M1:
 - **External references** - Ordinary inter-library targets can remain external
 - **Analysis layout** - Images with insufficient header padding use a separate `__DYLEX_HDR` segment; original code addresses remain unchanged
 - **Unknown extensions** - Version-4 ObjC optimization fields after the common prefix are not interpreted as version-2 buffer sizes
-- **Merged extraction** - `--merge-deps` retains its separate experimental relocation pipeline; Golden Gate behavior for that mode has not been validated
+- **Merged extraction** - `--merge-image` supports explicit selection at cache addresses, with at most 255 retained symbol sections after removing unused empty markers. `--merge-deps` retains its separate experimental relocation pipeline
 
 ## Comparison with Other Tools
 

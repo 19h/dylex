@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::macho::{
     DyldInfoCommand, DysymtabCommand, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_DATA_IN_CODE,
     LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_FUNCTION_STARTS, LinkeditDataCommand,
-    LoadCommandInfo, Nlist64, SymtabCommand,
+    LoadCommandInfo, N_INDR, N_STAB, N_TYPE, Nlist64, SymtabCommand,
 };
 
 use super::ExtractionContext;
@@ -250,6 +250,32 @@ impl<'a> LinkeditOptimizer<'a> {
             .data_at_addr(linkedit.command.vmaddr + relative, size as usize)
     }
 
+    // N_INDR uses n_value as a string-table index, not a virtual address.
+    fn copy_alias_target(&mut self, nlist: &mut Nlist64, symtab: SymtabCommand) -> Result<()> {
+        if nlist.n_type & N_STAB != 0 || nlist.n_type & N_TYPE != N_INDR {
+            return Ok(());
+        }
+        let index = u32::try_from(nlist.n_value)
+            .ok()
+            .filter(|i| *i < symtab.strsize)
+            .ok_or(Error::Parse {
+                offset: 0,
+                reason: "alias string index out of bounds".into(),
+            })?;
+        let offset = symtab.stroff.checked_add(index).ok_or(Error::Parse {
+            offset: 0,
+            reason: "alias string offset overflow".into(),
+        })?;
+        let data = self.read_linkedit_data(offset, symtab.strsize - index)?;
+        let end = data.iter().position(|b| *b == 0).ok_or(Error::Parse {
+            offset: offset as usize,
+            reason: "unterminated alias target".into(),
+        })?;
+        let target = data[..end].to_vec();
+        nlist.n_value = self.string_pool.add(&target) as u64;
+        Ok(())
+    }
+
     /// Copies binding info to the new LINKEDIT.
     #[allow(dead_code)]
     fn copy_binding_info(&mut self) -> Result<()> {
@@ -371,6 +397,7 @@ impl<'a> LinkeditOptimizer<'a> {
 
             let mut new_nlist = nlist;
             new_nlist.n_strx = new_strx;
+            self.copy_alias_target(&mut new_nlist, symtab)?;
 
             self.new_linkedit.extend_from_slice(new_nlist.as_bytes());
             self.symbol_count += 1;
@@ -607,6 +634,7 @@ impl<'a> LinkeditOptimizer<'a> {
 
             let mut new_nlist = nlist;
             new_nlist.n_strx = new_strx;
+            self.copy_alias_target(&mut new_nlist, symtab)?;
 
             self.new_linkedit.extend_from_slice(new_nlist.as_bytes());
             self.symbol_count += 1;
@@ -668,6 +696,7 @@ impl<'a> LinkeditOptimizer<'a> {
 
             let mut new_nlist = nlist;
             new_nlist.n_strx = new_strx;
+            self.copy_alias_target(&mut new_nlist, symtab)?;
 
             self.new_linkedit.extend_from_slice(new_nlist.as_bytes());
             self.symbol_count += 1;
@@ -753,6 +782,13 @@ impl<'a> LinkeditOptimizer<'a> {
                 self.new_linkedit
                     .extend_from_slice(&sym_index.to_le_bytes());
                 continue;
+            }
+
+            if self.symtab.is_none_or(|table| sym_index >= table.nsyms) {
+                return Err(Error::Parse {
+                    offset,
+                    reason: "indirect symbol index outside source symbol table".into(),
+                });
             }
 
             // NOTE: Index 0 is a valid symbol index (the first symbol in the table).
