@@ -2,7 +2,11 @@
 //! bytes; combine sections, symbols and indirect tables before cache/ObjC repair.
 use super::*;
 use crate::{DyldContext, Error, MachOContext, Result, macho::*};
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 use zerocopy::{FromBytes, IntoBytes};
 
 fn invalid(reason: &str) -> Error {
@@ -73,30 +77,16 @@ pub fn extract_image_with_selected_images<P: AsRef<Path>>(
     verbosity: u8,
 ) -> Result<()> {
     let paths = selected_merge_images(cache, primary, additions)?;
-    // Enforce predictable format limits before copying any image payload.
-    let mut original_sections = 0usize;
+    // Enforce the 32-bit file-offset limit before copying any image payload.
+    // Section count is unbounded; see `SectionOrdinals` for nlist encoding.
     let mut original_bytes = 0u64;
     for path in &paths {
         let source = cache.image_header(cache.resolve_image(path)?.address)?;
         for segment in source.segments().filter(|s| s.name() != "__LINKEDIT") {
-            original_sections = original_sections
-                .checked_add(
-                    segment
-                        .sections
-                        .iter()
-                        .filter(|s| s.section.size != 0)
-                        .count(),
-                )
-                .ok_or_else(|| invalid("section count overflow"))?;
             original_bytes = original_bytes
                 .checked_add(segment.command.filesize)
                 .ok_or_else(|| invalid("selected size overflow"))?;
         }
-    }
-    if original_sections > 255 {
-        return Err(invalid(
-            "selected merge exceeds 255 nonempty Mach-O symbol sections; select fewer images",
-        ));
     }
     if original_bytes > u32::MAX as u64 {
         return Err(invalid(
@@ -138,8 +128,61 @@ pub fn extract_image_with_selected_images<P: AsRef<Path>>(
 
 struct Symbol {
     entry: Nlist64,
+    /// Merged section ordinal (0 = NO_SECT); may exceed `n_sect`'s 8 bits.
+    section: usize,
     name: Vec<u8>,
     alias: Option<Vec<u8>>,
+}
+
+/// Encodes merged section ordinals as 8-bit `n_sect` values.
+///
+/// A merge can retain more than 255 sections, but `n_sect` cannot name them.
+/// Ordinals 1..=255 are exact. A later section is represented by the first
+/// nonempty exact-ordinal section with the same name and flags, else the same
+/// type and instruction attributes, else the first nonempty section. `n_value`
+/// stays authoritative: IDA places names by address, and LLDB resolves the
+/// section containing the address when the hinted section does not contain
+/// it. `NO_SECT` would make LLDB drop the symbol; `N_ABS` loses IDA names.
+struct SectionOrdinals(Vec<u8>);
+
+impl SectionOrdinals {
+    fn new<'a>(sections: impl Iterator<Item = &'a Section64>) -> Self {
+        let class = |s: &Section64| {
+            s.flags & (SECTION_TYPE | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)
+        };
+        let mut hints = vec![0u8];
+        let mut by_name = HashMap::new();
+        let mut by_class = HashMap::new();
+        let mut first = None;
+        for (index, section) in sections.enumerate() {
+            let Ok(ordinal) = u8::try_from(index + 1) else {
+                hints.push(
+                    by_name
+                        .get(&(section.sectname, section.flags))
+                        .or_else(|| by_class.get(&class(section)))
+                        .copied()
+                        .or(first)
+                        .unwrap_or(1),
+                );
+                continue;
+            };
+            if section.size != 0 {
+                by_name
+                    .entry((section.sectname, section.flags))
+                    .or_insert(ordinal);
+                by_class.entry(class(section)).or_insert(ordinal);
+                first.get_or_insert(ordinal);
+            }
+            hints.push(ordinal);
+        }
+        Self(hints)
+    }
+    fn n_sect(&self, section: usize) -> Result<u8> {
+        self.0
+            .get(section)
+            .copied()
+            .ok_or_else(|| invalid("symbol section ordinal out of bounds"))
+    }
 }
 struct Segment {
     command: SegmentCommand64,
@@ -182,6 +225,8 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
             }
         }
         let mut section_remap = vec![0usize];
+        // Nonempty retained sections of this image as (addr, end, ordinal).
+        let mut extents = Vec::<(u64, u64, usize)>::new();
         let indirect_base = u32size(indirect.len())?;
         let symbol_base = u32size(symbols.len())?;
         for seg in image.segments().filter(|s| s.name() != "__LINKEDIT") {
@@ -236,11 +281,9 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
                 }
                 sections.push(section);
                 section_count += 1;
-            }
-            if section_count > 255 {
-                return Err(invalid(
-                    "selected merge exceeds 255 symbol sections after removing unused empty sections; select fewer images",
-                ));
+                if section.size != 0 {
+                    extents.push((section.addr, section.addr + section.size, section_count));
+                }
             }
             command.nsects = u32size(sections.len())?;
             command.cmdsize = u32size(SegmentCommand64::SIZE + sections.len() * Section64::SIZE)?;
@@ -290,13 +333,14 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
                         } else {
                             None
                         };
-                        if entry.n_sect != 0 {
-                            let ordinal = *section_remap
+                        let section = if entry.n_sect == 0 {
+                            0
+                        } else {
+                            *section_remap
                                 .get(entry.n_sect as usize)
                                 .filter(|ordinal| **ordinal != 0)
-                                .ok_or_else(|| invalid("symbol section ordinal out of bounds"))?;
-                            entry.n_sect = u8::try_from(ordinal).map_err(|_| invalid("symbol section ordinal exceeds 255 after removing unused empty sections"))?;
-                        }
+                                .ok_or_else(|| invalid("symbol section ordinal out of bounds"))?
+                        };
                         if entry.n_type & N_STAB == 0 && entry.n_type & N_TYPE == N_PBUD {
                             entry.n_type = (entry.n_type & !N_TYPE) | N_UNDF;
                             entry.n_value = 0;
@@ -308,6 +352,7 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
                         }
                         symbols.push(Symbol {
                             entry,
+                            section,
                             name: tail[..end].to_vec(),
                             alias,
                         });
@@ -378,6 +423,8 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
         }
         // Represent starts below the primary __TEXT too: LC_FUNCTION_STARTS
         // cannot encode negative deltas, while N_SECT function labels can.
+        // Segments do not overlap, so nonempty sections are disjoint.
+        extents.sort_unstable();
         for lc in &image.load_commands {
             if let LoadCommandInfo::LinkeditData { command: c, .. } = lc {
                 if c.cmd != LC_FUNCTION_STARTS || c.datasize == 0 {
@@ -401,20 +448,22 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
                     if defined.contains(&address) {
                         continue;
                     }
-                    let ordinal = segments
-                        .iter()
-                        .flat_map(|s| &s.sections)
-                        .position(|s| address >= s.addr && address - s.addr < s.size)
+                    let section = extents
+                        .partition_point(|&(start, _, _)| start <= address)
+                        .checked_sub(1)
+                        .map(|i| extents[i])
+                        .filter(|&(_, end, _)| address < end)
                         .ok_or_else(|| invalid("function start outside selected sections"))?
-                        + 1;
+                        .2;
                     symbols.push(Symbol {
                         entry: Nlist64 {
                             n_strx: 0,
                             n_type: N_SECT,
-                            n_sect: ordinal as u8,
+                            n_sect: 0,
                             n_desc: 0,
                             n_value: address,
                         },
+                        section,
                         name: format!("sub_{address:X}").into_bytes(),
                         alias: None,
                     });
@@ -439,10 +488,12 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
     let mut counts = [0u32; 3];
     let mut linkedit = Vec::new();
     let mut strings = vec![0];
+    let ordinals = SectionOrdinals::new(segments.iter().flat_map(|s| &s.sections));
     for (new, &old) in order.iter().enumerate() {
         remap[old] = u32size(new)?;
         counts[class(&symbols[old])] += 1;
         let mut entry = symbols[old].entry;
+        entry.n_sect = ordinals.n_sect(symbols[old].section)?;
         entry.n_strx = u32size(strings.len())?;
         strings.extend_from_slice(&symbols[old].name);
         strings.push(0);
@@ -743,5 +794,205 @@ mod tests {
             let off = merged.addr_to_offset(address).unwrap();
             assert_eq!(&merged.data[off..off + 16], &[0x5a; 16]);
         }
+    }
+
+    const CODE: u32 = S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+    fn section(sectname: &str, addr: u64, size: u64, offset: u32, flags: u32) -> Section64 {
+        Section64 {
+            sectname: name(sectname),
+            segname: name("__TEXT"),
+            addr,
+            size,
+            offset,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }
+    }
+    /// `count` populated sections alternating `__text`/`__const`, one external
+    /// symbol per section, and one unnamed function start in the last section.
+    fn populated_image(base: u64, count: usize) -> MachOContext {
+        const DATA: usize = 0x8000;
+        const LINK: usize = 0xc000;
+        let strings: Vec<u8> = std::iter::once(0)
+            .chain((0..count).flat_map(|i| format!("_s{i}\0").into_bytes()))
+            .collect();
+        let stroff = LINK + count * 16;
+        let starts_off = stroff + strings.len();
+        let mut starts = Vec::new();
+        crate::dyld::trie::write_uleb128((DATA + (count - 1) * 0x10 + 8) as u64, &mut starts);
+        starts.push(0);
+        let mut data = vec![0u8; starts_off + starts.len()];
+        let text = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: u32size(72 + count * 80).unwrap(),
+            segname: name("__TEXT"),
+            vmaddr: base,
+            vmsize: LINK as u64,
+            fileoff: 0,
+            filesize: LINK as u64,
+            maxprot: 5,
+            initprot: 5,
+            nsects: count as u32,
+            flags: 0,
+        };
+        let mut commands = text.as_bytes().to_vec();
+        for i in 0..count {
+            let offset = DATA + i * 0x10;
+            let (sectname, flags) = if i % 2 == 0 {
+                ("__text", CODE)
+            } else {
+                ("__const", 0)
+            };
+            let s = section(sectname, base + offset as u64, 0x10, offset as u32, flags);
+            commands.extend_from_slice(s.as_bytes());
+            data[offset..offset + 0x10].fill(i as u8);
+            let strx = strings
+                .windows(format!("_s{i}\0").len())
+                .position(|w| w == format!("_s{i}\0").as_bytes())
+                .unwrap();
+            let symbol = Nlist64 {
+                n_strx: strx as u32,
+                n_type: N_SECT | N_EXT,
+                n_sect: (i + 1) as u8,
+                n_desc: 0,
+                n_value: base + offset as u64,
+            };
+            data[LINK + i * 16..LINK + i * 16 + 16].copy_from_slice(symbol.as_bytes());
+        }
+        let link = SegmentCommand64 {
+            segname: name("__LINKEDIT"),
+            vmaddr: base + 0x100000,
+            vmsize: (data.len() - LINK) as u64,
+            fileoff: LINK as u64,
+            filesize: (data.len() - LINK) as u64,
+            maxprot: 1,
+            initprot: 1,
+            nsects: 0,
+            cmdsize: 72,
+            ..text
+        };
+        commands.extend_from_slice(link.as_bytes());
+        let symtab = SymtabCommand {
+            cmd: LC_SYMTAB,
+            cmdsize: 24,
+            symoff: LINK as u32,
+            nsyms: count as u32,
+            stroff: stroff as u32,
+            strsize: strings.len() as u32,
+        };
+        commands.extend_from_slice(symtab.as_bytes());
+        let function_starts = LinkeditDataCommand {
+            cmd: LC_FUNCTION_STARTS,
+            cmdsize: 16,
+            dataoff: starts_off as u32,
+            datasize: starts.len() as u32,
+        };
+        commands.extend_from_slice(function_starts.as_bytes());
+        let header = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64E,
+            filetype: 6,
+            ncmds: 4,
+            sizeofcmds: commands.len() as u32,
+            flags: 0,
+            reserved: 0,
+        };
+        assert!(32 + commands.len() <= DATA);
+        data[..32].copy_from_slice(header.as_bytes());
+        data[32..32 + commands.len()].copy_from_slice(&commands);
+        data[stroff..starts_off].copy_from_slice(&strings);
+        data[starts_off..].copy_from_slice(&starts);
+        MachOContext::new(&data, 0).unwrap()
+    }
+    #[test]
+    fn more_than_255_populated_sections_are_retained_with_ordinal_hints() {
+        let bases = [0x180010000, 0x180110000];
+        let images = bases.map(|base| populated_image(base, 200));
+        let merged = combine_images(&images, 0x180000000).unwrap();
+        let sections: Vec<_> = merged
+            .segments()
+            .flat_map(|s| &s.sections)
+            .map(|s| s.section)
+            .collect();
+        assert_eq!(sections.len(), 400);
+        let table = merged.symtab().unwrap();
+        let strings = &merged.data[table.stroff as usize..][..table.strsize as usize];
+        let mut hinted = 0;
+        let mut labels = Vec::new();
+        for raw in
+            merged.data[table.symoff as usize..][..table.nsyms as usize * 16].chunks_exact(16)
+        {
+            let (n, _) = Nlist64::read_from_prefix(raw).unwrap();
+            let actual = 1 + sections
+                .iter()
+                .position(|s| n.n_value >= s.addr && n.n_value - s.addr < s.size)
+                .unwrap();
+            let hint = &sections[n.n_sect as usize - 1];
+            if actual <= 255 {
+                assert_eq!(n.n_sect as usize, actual);
+            } else {
+                hinted += 1;
+                assert_ne!(n.n_sect, 0);
+                assert_eq!(
+                    (hint.sectname, hint.flags),
+                    (sections[actual - 1].sectname, sections[actual - 1].flags)
+                );
+                assert!(!(n.n_value >= hint.addr && n.n_value - hint.addr < hint.size));
+            }
+            let tail = &strings[n.n_strx as usize..];
+            let label = &tail[..tail.iter().position(|b| *b == 0).unwrap()];
+            if label.starts_with(b"sub_") {
+                labels.push((n.n_value, actual, hint.sectname));
+            }
+        }
+        assert_eq!(hinted, 400 - 255 + 1);
+        let last = 0x8000 + 199 * 0x10 + 8;
+        assert_eq!(
+            labels,
+            [
+                (bases[0] + last, 200, name("__const")),
+                (bases[1] + last, 400, name("__const")),
+            ]
+        );
+        for (image, base) in bases.iter().enumerate() {
+            for i in [0usize, 199] {
+                let off = merged
+                    .addr_to_offset(base + 0x8000 + i as u64 * 0x10)
+                    .unwrap();
+                assert_eq!(
+                    &merged.data[off..off + 0x10],
+                    &[i as u8; 0x10],
+                    "{image}:{i}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn section_ordinal_hints_prefer_name_then_type_then_first_populated() {
+        let mut sections = vec![
+            section("__marker", 0x1000, 0, 0, 0),
+            section("__text", 0x1000, 16, 0, CODE),
+            section("__const", 0x1010, 16, 0, 0),
+        ];
+        sections.extend((3..255).map(|i| section("__data", 0x2000 + i * 16, 16, 0, 0)));
+        sections.extend([
+            section("__text", 0x9000, 16, 0, CODE),
+            section("__const", 0x9010, 16, 0, 0),
+            section("__swift_text", 0x9020, 16, 0, CODE),
+            section("__bss", 0x9030, 16, 0, S_ZEROFILL),
+            section("__marker", 0x9040, 0, 0, 0),
+        ]);
+        let ordinals = SectionOrdinals::new(sections.iter());
+        let hints: Vec<_> = (0..=260).map(|i| ordinals.n_sect(i).unwrap()).collect();
+        assert_eq!(hints[..4], [0, 1, 2, 3]);
+        assert_eq!(hints[255], 255);
+        assert_eq!(hints[256..], [2, 3, 2, 2, 3]);
+        assert!(ordinals.n_sect(261).is_err());
     }
 }

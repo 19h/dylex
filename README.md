@@ -40,6 +40,16 @@ cd dylex
 cargo install --path .
 ```
 
+### GitHub Actions binaries
+
+The [macOS build workflow](.github/workflows/build-macos.yml) tests and builds
+Intel (`x86_64`) and Apple Silicon (`arm64`) binaries on pushes, pull requests,
+and manual runs. Download `dylex-x86_64-apple-darwin` or
+`dylex-aarch64-apple-darwin` from the run's artifacts. Each contains a `.tar.gz`
+with the executable and license, plus a SHA-256 checksum file.
+
+See [CI build details](docs/ci.md) for runner selection and validation scope.
+
 ## Quick Start
 
 ```bash
@@ -134,9 +144,11 @@ Frameworks and other libraries remain explicit additions.
 `--merge-plan` writes no output. Computed calls without static pointer evidence
 are unknown; x86 inference uses pointer sections rather than instruction decoding.
 On the tested cache, GeoServicesCore selects ten runtime libraries. Empty section
-markers left by cache optimization are omitted unless a symbol references them;
-all retained section ordinals are remapped. This allows its 271 source section
-records to fit as 226 retained sections without removing populated sections.
+markers left by cache optimization are omitted unless a symbol references them.
+All populated sections are retained regardless of count. Because nlist `n_sect`
+is 8 bits, a symbol in a section past ordinal 255 carries the ordinal of an
+earlier section of the same kind; its address stays exact. Adding GeoServices
+as a root infers 29 runtime images and merges 31 images into 724 sections.
 
 ### Merge selected images
 

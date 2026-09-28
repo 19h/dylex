@@ -1,7 +1,8 @@
 # Address lookup, explicit-image merging, and runtime inference
 
-Observed and tested on macOS 27.0 build **26A5425a**, 2026-09-14.
-All addresses below are **unslid virtual byte addresses** from that cache, not
+Observed and tested on macOS 27.0 build **26A5425a**, 2026-09-14. Section
+counts beyond 255 were validated on macOS 27.2 build **26B5091g**, 2026-09-28.
+All addresses below are **unslid virtual byte addresses** from those caches, not
 addresses assumed to apply to another build.
 
 ## Result and usage
@@ -72,6 +73,12 @@ The merged set comprises 11 images. Its 271 original section records contain 45
 unused empty markers; removing those and remapping ordinals yields 226 retained
 original sections. Populated sections and symbol-referenced empty sections remain.
 
+Adding `--merge-image GeoServices` as a second root infers 29 runtime images on
+26B5091g. The 31 selected images have 686 populated sections, 405 of them
+referenced by symbols, so no ordering fits every symbol-bearing section into
+`n_sect`. The output retains all of them: 724 sections, including support and
+restored ObjC sections, and 200 segments in a 278 MB file.
+
 ## Implementation contract
 
 - Materialize each selected image through VM mappings, decode slide pointers,
@@ -81,13 +88,21 @@ original sections. Populated sections and symbol-referenced empty sections remai
   A separate `__DYLEX_HDR` supplies load-command capacity. Synthetic LINKEDIT
   occupies unused addresses below the cache; restored ObjC data occupies unused
   addresses above it. Segments must not overlap.
+- Retain every populated and symbol-referenced section; section count is not
+  limited. `n_sect` is an 8-bit ordinal with zero reserved, so ordinals 1–255
+  are written exactly. A symbol in a later section gets the first populated
+  exact-ordinal section with the same name and flags, else the same section
+  type and instruction attributes, else the first populated section. `n_value`
+  remains exact and never lies inside the hinted section. `NO_SECT` and `N_ABS`
+  are not used for these symbols (see S9).
 - Remap nlist section ordinals and indirect-symbol indexes. Stably group local,
   external-definition, and undefined symbols. Undefined imports use flat lookup
   rather than source-image dylib ordinals; prebound undefined entries become
   ordinary undefined entries. `N_INDR.n_value` is a string-table index and is
   rewritten in both the ordinary LINKEDIT optimizer and selected merge.
 - Preserve function starts as section-defined labels when no symbol already
-  names the address. This represents dependency functions below the primary
+  names the address. Each start is found by binary search over its image's
+  populated sections. This represents dependency functions below the primary
   `__TEXT`, which a primary-relative unsigned delta stream cannot encode.
 - Combine data-in-code records and remap their file offsets. Discard stale
   runtime binding/export/fixup streams; keep symbol tables for analysis.
@@ -96,11 +111,8 @@ original sections. Populated sections and symbol-referenced empty sections remai
 - Fail before writing on overlapping segments, malformed symbol/alias indexes,
   unsupported section relocations, or format-limit violations. Empty sections
   without nlist references are omitted and every source section ordinal is
-  remapped. At most **255 retained original sections** can be represented:
-  `n_sect` is an 8-bit ordinal with zero reserved. Populated or referenced-empty
-  sections are never discarded to meet that limit. File offsets are limited by
-  their 32-bit Mach-O fields. Nonempty-section/byte limits are checked before
-  payload copying; the final retained ordinal count is checked during assembly.
+  remapped. File offsets are limited by their 32-bit Mach-O fields; the selected
+  byte total is checked before payload copying.
 
 Outputs are static-analysis containers. Runtime loading, code signing, and
 complete resolution of unselected external targets are outside this contract.
@@ -119,10 +131,13 @@ if neither nlist nor export entries name the location, its symbol is unknown.
 | S6 | Automatic dependency relocation is a separate mode; this validation covers explicit selection. | CLI rejects mixed selection modes. The legacy automatic merge's instruction-relocation completeness remains unknown. |
 | S7 | Runtime inference is a bounded static-reference analysis, not runtime call-graph completeness. | Tests exclude unreferenced libraries, framework targets, embedded data, and transitive runtime references; explicit additions become scan roots and pointer slots count as evidence. Register-only/computed targets remain unknown. |
 | S8 | An empty section without any nlist references is a removable marker. | A fixture merges 400 source section records into three retained sections, preserves an explicitly referenced empty section, checks remapped ordinals, and compares code bytes. The live 271-record runtime set passes after compaction. |
+| S9 | Analysis consumers place nlist symbols by `n_value`; `n_sect` past 255 is a same-kind hint. Retaining more than 255 sections depends on this. | Synthetic 300-section Mach-Os with symbols past 255 encoded as exact-wrapped, clamped, same-kind, cross-kind, `NO_SECT`, and `N_ABS`. **IDA 9.4** names every `N_SECT` variant by address and classifies code/data by the containing segment; it moves `N_ABS` symbols to an ABS segment and drops their names. **LLDB** resolves a nonzero hint to the section containing the address, with the correct code/data type; it drops `N_SECT` symbols with `NO_SECT`. Fixtures check exact ordinals through 255, same-name hints after, and fallback order. Tools that trust `n_sect` without checking the address print the hinted section name (for example, `nm -m`). |
 
 ## Validation
 
-- **58 tests and one doctest pass**. Three live-cache tests are opt-in.
+- **60 tests and one doctest pass**. Three live-cache tests are opt-in. On
+  26B5091g, the two opt-in tests pinned to 26A5425a addresses fail identically
+  with and without the section-ordinal change; the runtime-merge test passes.
 - Fixtures cover canonical selection/deduplication/ambiguity, cache-owned and
   image-owned addresses, exact/nearest symbols, cycle and hop limits, preserved
   branches/island instructions, unselected image exclusion, symbol aliases,
@@ -148,7 +163,24 @@ if neither nlist nor export entries name the location, its symbol is unknown.
 - Runtime fixtures cover pointer evidence, local/cache stubs, data-in-code
   exclusion, nonrecursive selection, explicit roots, policy boundaries, and a
   preview that does not write. A 400-section fixture verifies empty-marker
-  compaction and retention of referenced empty sections.
+  compaction and retention of referenced empty sections. A second fixture keeps
+  400 populated sections, hints symbol and function-start ordinals past 255,
+  and compares their bytes.
+- Beyond 255 sections (26B5091g): the 31-image command
+  `dylex extract -i GeoServicesCore --merge-runtime --merge-image GeoServices`
+  exits 0 in **1.26 s**, measured once. Of its N_SECT symbols inside retained
+  sections, 320907 have exact ordinals, 30188 same-name hints, and 13 same-type
+  hints. None has `NO_SECT`, and no hint contains its symbol's address. The
+  remaining 15780 are symbols at addresses outside retained sections, mostly
+  `objc_msgSend$` stubs in emptied `__objc_stubs`, as in earlier outputs.
+  `otool -l` and `nm -m` accept the file. In a fresh IDA 9.4 database, 752
+  segments load. Sampled names apply equally for exact and hinted sections.
+  Unmatched samples are aliases at shared addresses. `GEOGetTileLoadingLog`
+  decompiles with named `j__dispatch_once` and
+  `objc_retainAutoreleaseReturnValue` calls, with libdispatch now past
+  ordinal 255. `xpc_dictionary_get_string` (libxpc, image 30) and `dispatch_once`
+  decompile with named callees. The 11-image runtime merge and the three-image
+  selected merge are byte-identical to the previous build's output.
 - Full and reduced Rosetta products each successfully merge libdispatch with
   libsystem_blocks; `otool -l` passes. Each measured output is **638976 B**.
 - The measured native two-image output is **144531456 B**; the three-image output
@@ -187,7 +219,7 @@ with prefix maxima (`O(R log R)` time, `O(R)` space for `R` cache segments), sca
 source instructions/pointer slots, memoizes each unique target, and uses bounded
 stub traversal. Each ownership query is `O(log R + K)` for `K` overlapping ranges;
 normal nonoverlapping ranges have `K = 1`. Data-in-code exclusion checks its
-recorded intervals per instruction. Candidate paths are sorted for stable output. Merge uses `O(B + N log N + S² + F S)` time before the
+recorded intervals per instruction. Candidate paths are sorted for stable output. Merge uses `O(B + N log N + S² + F log S)` time before the
 existing slide/support/ObjC stages and `O(B + N + S)` memory, with multiple
 materialized copies contributing to the constant factor. Source-pointer,
 trampoline and metadata-stage bounds are described in
@@ -227,6 +259,10 @@ Primary provenance:
 - **Low impact [S6]:** automatic and explicit merging remain separate modes;
   explicit CLI conflicts prevent accidentally triggering dependency traversal.
 
+- **High impact [S9]:** a 31-image runtime merge was rejected at the 255-section
+  check. It has 405 symbol-bearing sections, so neither compaction nor ordering
+  could fit it. Hinted ordinals remove the section-count limit; merges that
+  already fit produce byte-identical output.
 - **High impact [S8]:** counting empty cache-optimizer markers against the nlist
   limit rejected an otherwise representable runtime merge. Referenced-section
   retention and ordinal remapping remove that failure without truncating ordinals.
