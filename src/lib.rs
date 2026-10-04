@@ -12,6 +12,7 @@
 //! - LINKEDIT optimization
 //! - Stub fixing
 //! - ObjC metadata restoration
+//! - Literal string search across cache images
 //!
 //! # Example
 //!
@@ -47,7 +48,10 @@ pub use converter::{
     RuntimeImageReference, extract_image_with_selected_images, referenced_runtime_images,
     selected_merge_images,
 };
-pub use dyld::{DyldContext, ImageEntry, MappingEntry};
+pub use dyld::{
+    ContainingImages, DyldContext, ImageEntry, MappingEntry, StringHit, StringQuery,
+    StringSearchOutcome,
+};
 pub use error::{Error, Result};
 pub use macho::MachOContext;
 

@@ -23,11 +23,13 @@
 mod context;
 mod lookup;
 mod objc;
+mod strings;
 mod structs;
 pub mod trie;
 
 pub use context::*;
 pub use lookup::*;
 pub use objc::*;
+pub use strings::*;
 pub use structs::*;
 pub use trie::*;

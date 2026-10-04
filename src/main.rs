@@ -16,7 +16,8 @@ use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use dylex::{
-    DyldContext, ExtractionOptions, extract_image_with_options, extract_images_with_dependencies,
+    DyldContext, ExtractionOptions, ImageEntry, StringHit, StringQuery, extract_image_with_options,
+    extract_images_with_dependencies,
 };
 
 /// Default locations to search for dyld shared caches on macOS.
@@ -45,17 +46,32 @@ enum Commands {
     /// Extract images from the cache
     Extract {
         /// Image to extract (e.g., "UIKit" or "/System/Library/Frameworks/UIKit.framework/UIKit")
-        /// If not specified, requires --filter to select images
+        /// If not specified, requires --filter or --search to select images
         #[arg(short, long)]
         image: Option<String>,
 
-        /// Filter images by substring match (can extract multiple images)
+        /// Filter images by substring match (can extract multiple images).
+        /// With --search, only images whose path contains this substring are searched.
         #[arg(short, long)]
         filter: Option<String>,
 
+        /// Extract every image that contains this literal string.
+        /// Combines with --filter. A range mapped by more than one image is not searched.
+        #[arg(
+            long,
+            conflicts_with = "image",
+            conflicts_with_all = ["merge_deps", "merge_images", "merge_runtime", "merge_plan"]
+        )]
+        search: Option<String>,
+
+        /// Compare ASCII letters without regard to case. Requires --search.
+        #[arg(long, requires = "search")]
+        ignore_case: bool,
+
         /// Architecture to use (e.g., "arm64e", "arm64", "x86_64")
         /// Substring match: "arm64" matches "arm64e"
-        #[arg(short, long)]
+        /// Pass cache paths as the positional [CACHE] argument, without -a
+        #[arg(short, long, value_parser = parse_arch)]
         arch: Option<String>,
 
         /// Output path (file for single image, directory for multiple)
@@ -116,7 +132,8 @@ enum Commands {
     /// List all images in the cache
     List {
         /// Architecture to use (e.g., "arm64e", "arm64", "x86_64")
-        #[arg(short, long)]
+        /// Pass cache paths as the positional [CACHE] argument, without -a
+        #[arg(short, long, value_parser = parse_arch)]
         arch: Option<String>,
 
         /// Filter images by name
@@ -136,10 +153,44 @@ enum Commands {
         cache: Option<PathBuf>,
     },
 
+    /// Search images for a literal string
+    Strings {
+        /// Literal string to find, such as com.apple.hid.manager.user-access-device
+        needle: String,
+
+        /// Only search images whose path contains this substring.
+        /// Omit to search every image.
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// Architecture to search, repeatable (for example arm64e or x86_64).
+        /// Omit to use the default cache.
+        /// Pass cache paths as the positional [CACHE] argument, without -a
+        #[arg(short, long, value_parser = parse_arch)]
+        arch: Vec<String>,
+
+        /// Search every discovered architecture cache
+        #[arg(long, conflicts_with = "arch")]
+        all_arches: bool,
+
+        /// Compare ASCII letters without regard to case
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+
+        /// Number of parallel jobs (default: number of CPUs)
+        #[arg(short, long)]
+        jobs: Option<usize>,
+
+        /// Path to the dyld shared cache (file or directory).
+        /// If not specified, searches default system locations.
+        cache: Option<PathBuf>,
+    },
+
     /// Show cache information
     Info {
         /// Architecture to use (e.g., "arm64e", "arm64", "x86_64")
-        #[arg(short, long)]
+        /// Pass cache paths as the positional [CACHE] argument, without -a
+        #[arg(short, long, value_parser = parse_arch)]
         arch: Option<String>,
 
         /// Path to the dyld shared cache (file or directory).
@@ -160,13 +211,27 @@ enum Commands {
         address: String,
 
         /// Architecture to use
-        #[arg(short, long)]
+        /// Pass cache paths as the positional [CACHE] argument, without -a
+        #[arg(short, long, value_parser = parse_arch)]
         arch: Option<String>,
 
         /// Path to the dyld shared cache.
         /// If not specified, searches default system locations.
         cache: Option<PathBuf>,
     },
+}
+
+/// Reject cache paths supplied where an architecture filter is expected.
+/// Scans n input bytes in O(n) time; accepted filters use O(n) output space.
+fn parse_arch(value: &str) -> std::result::Result<String, String> {
+    if value.contains('/') {
+        return Err(
+            "--arch takes an architecture name (e.g., x86_64), not a cache path. \
+             Pass the cache path as the positional [CACHE] argument, without -a/--arch."
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 /// Information about a discovered cache file.
@@ -186,6 +251,8 @@ fn main() -> Result<()> {
             cache,
             image,
             filter,
+            search,
+            ignore_case,
             arch,
             output,
             preserve_paths,
@@ -204,6 +271,8 @@ fn main() -> Result<()> {
                 cache,
                 image,
                 filter,
+                search,
+                ignore_case,
                 arch,
                 output,
                 preserve_paths,
@@ -225,6 +294,15 @@ fn main() -> Result<()> {
             addresses,
             basenames,
         } => cmd_list(cache, arch, filter, addresses, basenames),
+        Commands::Strings {
+            cache,
+            needle,
+            filter,
+            arch,
+            all_arches,
+            ignore_case,
+            jobs,
+        } => cmd_strings(cache, needle, filter, arch, all_arches, ignore_case, jobs),
         Commands::Info { cache, arch } => cmd_info(cache, arch),
         Commands::Arches { path } => cmd_arches(path),
         Commands::Lookup {
@@ -280,6 +358,28 @@ fn get_cache_path(cache: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+/// Reads the architecture name from a dyld cache magic field.
+fn arch_from_magic(magic: &[u8]) -> Option<String> {
+    if magic.len() < 16 || !(magic.starts_with(b"dyld_v0 ") || magic.starts_with(b"dyld_v1 ")) {
+        return None;
+    }
+    let arch = std::str::from_utf8(&magic[7..])
+        .unwrap_or("")
+        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0')
+        .to_string();
+    if arch.is_empty() { None } else { Some(arch) }
+}
+
+/// Reads the architecture from a cache file's magic.
+fn architecture_of(path: &Path) -> Result<String> {
+    let mut magic = [0u8; 16];
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("Failed to open cache: {}", path.display()))?;
+    file.read_exact(&mut magic)
+        .with_context(|| format!("Failed to read cache magic: {}", path.display()))?;
+    arch_from_magic(&magic).with_context(|| format!("Not a dyld shared cache: {}", path.display()))
+}
+
 /// Discovers all dyld shared cache files in a directory.
 fn discover_caches(dir: &Path) -> Result<Vec<CacheInfo>> {
     let mut caches = Vec::new();
@@ -321,16 +421,10 @@ fn discover_caches(dir: &Path) -> Result<Vec<CacheInfo>> {
             {
                 continue;
             }
-            if !(magic.starts_with(b"dyld_v0 ") || magic.starts_with(b"dyld_v1 ")) {
+            let Some(arch) = arch_from_magic(&magic) else {
                 continue;
-            }
-            let arch = std::str::from_utf8(&magic[7..])
-                .unwrap_or("")
-                .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0')
-                .to_string();
-            if !arch.is_empty() {
-                caches.push(CacheInfo { path, arch });
-            }
+            };
+            caches.push(CacheInfo { path, arch });
         }
     }
     caches.sort_by(|a, b| a.arch.cmp(&b.arch).then(a.path.cmp(&b.path)));
@@ -397,12 +491,68 @@ fn resolve_cache_path(path: &Path, arch: Option<&str>) -> Result<PathBuf> {
             .map(|c| format!("{}: {}", c.arch, c.path.display()))
             .collect();
         bail!(
-            "Multiple caches match. Specify --arch or an exact cache file path. Available:\n  {}",
+            "Multiple caches match. Pass an exact cache file path as the positional [CACHE] argument, without -a/--arch. Available:\n  {}",
             available.join("\n  ")
         );
     }
 
     Ok(matching[0].path.clone())
+}
+
+/// Resolves one cache, several architectures, or every discovered cache.
+fn resolve_search_caches(
+    cache: Option<PathBuf>,
+    arches: &[String],
+    all_arches: bool,
+) -> Result<Vec<CacheInfo>> {
+    let cache_path = get_cache_path(cache)?;
+    if cache_path.is_file() {
+        let info = CacheInfo {
+            arch: architecture_of(&cache_path)?,
+            path: cache_path,
+        };
+        if !all_arches
+            && !arches.is_empty()
+            && !arches.iter().any(|arch| info.arch.contains(arch.as_str()))
+        {
+            bail!(
+                "cache architecture '{}' does not match {}",
+                info.arch,
+                arches.join(", ")
+            );
+        }
+        return Ok(vec![info]);
+    }
+    if !cache_path.is_dir() {
+        bail!("Cache path does not exist: {}", cache_path.display());
+    }
+    if all_arches {
+        let caches = discover_caches(&cache_path)?;
+        if caches.is_empty() {
+            bail!("No dyld shared caches found in: {}", cache_path.display());
+        }
+        return Ok(caches);
+    }
+    if arches.is_empty() {
+        let path = resolve_cache_path(&cache_path, None)?;
+        return Ok(vec![CacheInfo {
+            arch: architecture_of(&path)?,
+            path,
+        }]);
+    }
+
+    let mut selected = Vec::new();
+    for arch in arches {
+        let path = resolve_cache_path(&cache_path, Some(arch))?;
+        if selected.iter().any(|info: &CacheInfo| info.path == path) {
+            continue;
+        }
+        selected.push(CacheInfo {
+            arch: architecture_of(&path)?,
+            path,
+        });
+    }
+    Ok(selected)
 }
 
 /// Converts an image path to a relative output path.
@@ -418,10 +568,65 @@ fn image_to_output_path(image_path: &str, preserve_paths: bool) -> PathBuf {
     }
 }
 
+fn images_containing_query(
+    cache: &DyldContext,
+    query: &str,
+    filter: Option<&str>,
+    ignore_case: bool,
+    jobs: Option<usize>,
+) -> Result<Vec<ImageEntry>> {
+    if jobs == Some(0) {
+        bail!("--jobs must be at least 1");
+    }
+    if let Some(n) = jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .ok();
+    }
+    let image_count = cache.images_for_string_search(filter).len();
+    let progress = ProgressBar::new(image_count as u64);
+    if image_count > 0 {
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        progress.set_message("search");
+    }
+    let found = cache.images_containing(
+        &StringQuery {
+            needle: query.as_bytes().to_vec(),
+            ignore_case,
+            image_filter: filter.map(str::to_string),
+        },
+        || progress.inc(1),
+    )?;
+    progress.finish_and_clear();
+    if !found.skipped.is_empty() {
+        eprintln!(
+            "skipped {} images with unreadable Mach-O headers",
+            found.skipped.len()
+        );
+        for (index, reason) in found.skipped.iter().take(20).enumerate() {
+            eprintln!("  {reason}");
+            if index == 19 && found.skipped.len() > 20 {
+                eprintln!("  and {} more", found.skipped.len() - 20);
+            }
+        }
+    }
+    Ok(found.images)
+}
+
 fn cmd_extract(
     cache: Option<PathBuf>,
     image: Option<String>,
     filter: Option<String>,
+    search: Option<String>,
+    ignore_case: bool,
     arch: Option<String>,
     output: Option<PathBuf>,
     preserve_paths: Option<bool>,
@@ -436,6 +641,9 @@ fn cmd_extract(
     merge_depth: usize,
 ) -> Result<()> {
     let start = Instant::now();
+    if search.as_ref().is_some_and(|query| query.is_empty()) {
+        bail!("search string is empty");
+    }
     if merge_plan && !merge_runtime && merge_images.is_empty() {
         anyhow::bail!("--merge-plan requires --merge-runtime or --merge-image");
     }
@@ -538,7 +746,10 @@ fn cmd_extract(
     }
 
     // Determine what to extract
-    let images_to_extract: Vec<_> = if let Some(ref img_name) = image {
+    let from_search = search.is_some();
+    let images_to_extract: Vec<_> = if let Some(ref query) = search {
+        images_containing_query(&cache, query, filter.as_deref(), ignore_case, jobs)?
+    } else if let Some(ref img_name) = image {
         // Single image mode
         let img = cache
             .find_image(img_name)
@@ -552,12 +763,25 @@ fn cmd_extract(
             .cloned()
             .collect()
     } else {
-        bail!("Either --image or --filter must be specified");
+        bail!("Either --image, --filter, or --search must be specified");
     };
 
     if images_to_extract.is_empty() {
         warn!("No images match the criteria");
         return Ok(());
+    }
+    if from_search {
+        let dest = output.as_deref().map_or_else(
+            || "extracted".to_string(),
+            |path| path.display().to_string(),
+        );
+        let count = images_to_extract.len();
+        let images = if count == 1 { "image" } else { "images" };
+        let verb = if count == 1 { "contains" } else { "contain" };
+        eprintln!(
+            "{count} {images} {verb} {:?} into {dest}",
+            search.as_deref().unwrap_or("")
+        );
     }
 
     // Handle dependency extraction mode
@@ -632,12 +856,13 @@ fn cmd_extract(
 
     // Determine if we should preserve paths
     let should_preserve = preserve_paths.unwrap_or_else(|| {
-        // Default: preserve paths when extracting multiple images
-        images_to_extract.len() > 1
+        // A search extracts a set, so keep cache paths even for one hit.
+        from_search || images_to_extract.len() > 1
     });
 
-    // Single image extraction (without dependencies)
-    if images_to_extract.len() == 1 {
+    // Single image extraction (without dependencies).
+    // --search always writes a directory, including when one image matches.
+    if !from_search && images_to_extract.len() == 1 {
         let img = &images_to_extract[0];
         let output_path =
             output.unwrap_or_else(|| image_to_output_path(&img.path, should_preserve));
@@ -784,6 +1009,161 @@ fn cmd_list(
     }
 
     Ok(())
+}
+
+fn cmd_strings(
+    cache: Option<PathBuf>,
+    needle: String,
+    filter: Option<String>,
+    arches: Vec<String>,
+    all_arches: bool,
+    ignore_case: bool,
+    jobs: Option<usize>,
+) -> Result<()> {
+    if needle.is_empty() {
+        bail!("search string is empty");
+    }
+    if jobs == Some(0) {
+        bail!("--jobs must be at least 1");
+    }
+    if let Some(n) = jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .ok();
+    }
+
+    let caches = resolve_search_caches(cache, &arches, all_arches)?;
+    let labels = cache_labels(&caches);
+    let query = StringQuery {
+        needle: needle.into_bytes(),
+        ignore_case,
+        image_filter: filter.clone(),
+    };
+    let started = Instant::now();
+    let mut total_hits = 0usize;
+    let mut images_with_hits = 0usize;
+    let mut skipped = Vec::new();
+
+    for (info, label) in caches.iter().zip(labels.iter()) {
+        let cache = DyldContext::open(&info.path)
+            .with_context(|| format!("Failed to open cache: {}", info.path.display()))?;
+        let image_count = cache.images_for_string_search(filter.as_deref()).len();
+        if image_count == 0 {
+            let where_cache = label.as_deref().unwrap_or(&info.arch);
+            if filter.as_deref().unwrap_or("").is_empty() {
+                eprintln!("no images in {where_cache} ({})", info.path.display());
+            } else {
+                eprintln!(
+                    "no images match filter {:?} in {where_cache} ({})",
+                    filter.as_deref().unwrap_or(""),
+                    info.path.display()
+                );
+            }
+            continue;
+        }
+
+        let progress = ProgressBar::new(image_count as u64);
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        progress.set_message(info.arch.clone());
+        let outcome = cache.search_strings(&query, || {
+            progress.inc(1);
+        })?;
+        progress.finish_and_clear();
+
+        let mut seen_in_cache = std::collections::HashSet::new();
+        for hit in &outcome.hits {
+            seen_in_cache.insert(hit.image_path.as_str());
+            println!("{}", format_string_hit(&info.arch, label.as_deref(), hit));
+        }
+        images_with_hits += seen_in_cache.len();
+        total_hits += outcome.hits.len();
+        skipped.extend(outcome.skipped);
+    }
+
+    if !skipped.is_empty() {
+        eprintln!(
+            "skipped {} images with unreadable Mach-O headers",
+            skipped.len()
+        );
+        for (index, reason) in skipped.iter().take(20).enumerate() {
+            eprintln!("  {reason}");
+            if index == 19 && skipped.len() > 20 {
+                eprintln!("  and {} more", skipped.len() - 20);
+            }
+        }
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    if caches.len() > 1 {
+        eprintln!(
+            "{total_hits} matches in {images_with_hits} images across {} caches ({elapsed:.2}s)",
+            caches.len()
+        );
+    } else {
+        eprintln!("{total_hits} matches in {images_with_hits} images ({elapsed:.2}s)");
+    }
+    Ok(())
+}
+
+fn cache_labels(caches: &[CacheInfo]) -> Vec<Option<String>> {
+    if caches.len() < 2 {
+        return vec![None; caches.len()];
+    }
+    caches
+        .iter()
+        .map(|info| {
+            let name = info
+                .path
+                .file_name()
+                .map(|file_name| file_name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| info.path.display().to_string());
+            let unique = caches
+                .iter()
+                .filter(|other| other.path.file_name() == info.path.file_name())
+                .count()
+                == 1;
+            Some(if unique {
+                name
+            } else {
+                info.path.display().to_string()
+            })
+        })
+        .collect()
+}
+
+fn format_string_hit(arch: &str, cache_label: Option<&str>, hit: &StringHit) -> String {
+    let location = match &hit.section {
+        Some(section) => format!("{},{section}", hit.segment),
+        None => hit.segment.clone(),
+    };
+    let text = single_line(&hit.text);
+    match cache_label {
+        Some(label) => format!(
+            "{arch}  {label}  {}  {location}  {:#x}  {text}",
+            hit.image_path, hit.address
+        ),
+        None => format!(
+            "{arch}  {}  {location}  {:#x}  {text}",
+            hit.image_path, hit.address
+        ),
+    }
+}
+
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\t' | '\n' | '\r' => ' ',
+            _ => c,
+        })
+        .collect()
 }
 
 fn cmd_info(cache: Option<PathBuf>, arch: Option<String>) -> Result<()> {
@@ -1026,9 +1406,32 @@ mod discovery_tests {
         let error = resolve_cache_path(dir.path(), Some("x86"))
             .unwrap_err()
             .to_string();
+        assert!(error.contains("positional [CACHE] argument, without -a/--arch"));
         assert!(error.contains(full.to_str().unwrap()));
         assert!(error.contains(reduced.to_str().unwrap()));
         assert_eq!(resolve_cache_path(&reduced, None).unwrap(), reduced);
+
+        let all = resolve_search_caches(Some(dir.path().to_path_buf()), &[], true).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            resolve_search_caches(Some(dir.path().to_path_buf()), &["arm64e".into()], false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            resolve_search_caches(Some(dir.path().to_path_buf()), &["x86".into()], false).is_err()
+        );
+        let explicit = resolve_search_caches(Some(reduced.clone()), &[], false).unwrap();
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].arch, "x86_64");
+        assert_eq!(explicit[0].path, reduced);
+        assert!(
+            resolve_search_caches(Some(reduced), &["arm64e".into()], false)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
     }
     #[test]
     fn discovery_uses_magic_not_filename_and_ignores_invalid_files() {
@@ -1048,6 +1451,141 @@ mod discovery_tests {
 #[cfg(test)]
 mod selection_cli_tests {
     use super::*;
+
+    #[test]
+    fn cache_paths_are_positional_and_rejected_as_architectures() {
+        let path = "/System/Volumes/Preboot/Cryptexes/Rosetta/System/x86Support/System/Library/dyld/dyld_shared_cache_x86_64";
+        for command in ["extract", "list", "info", "lookup", "strings"] {
+            let mut args = vec!["dylex", command];
+            if command == "lookup" {
+                args.push("0x180000000");
+            }
+            if command == "strings" {
+                args.push("needle");
+            }
+
+            let mut invalid = args.clone();
+            invalid.extend(["-a", path]);
+            let error = Cli::try_parse_from(invalid).unwrap_err().to_string();
+            assert!(error.contains("positional [CACHE] argument, without -a/--arch"));
+
+            args.extend(["-a", "x86_64", path]);
+            let cli = Cli::try_parse_from(args).unwrap();
+            if command == "strings" {
+                match cli.command {
+                    Commands::Strings {
+                        arch,
+                        cache,
+                        needle,
+                        ..
+                    } => {
+                        assert_eq!(arch, vec!["x86_64".to_string()]);
+                        assert_eq!(cache, Some(PathBuf::from(path)));
+                        assert_eq!(needle, "needle");
+                    }
+                    _ => unreachable!(),
+                }
+                continue;
+            }
+            let (arch, cache) = match cli.command {
+                Commands::Extract { arch, cache, .. }
+                | Commands::List { arch, cache, .. }
+                | Commands::Info { arch, cache }
+                | Commands::Lookup { arch, cache, .. } => (arch, cache),
+                Commands::Strings { .. } | Commands::Arches { .. } => unreachable!(),
+            };
+            assert_eq!(arch.as_deref(), Some("x86_64"));
+            assert_eq!(cache, Some(PathBuf::from(path)));
+        }
+    }
+
+    #[test]
+    fn extract_search_accepts_a_filter_and_case_fold_and_rejects_single_image_modes() {
+        let cli = Cli::try_parse_from([
+            "dylex",
+            "extract",
+            "--search",
+            "com.apple.hid.manager.user-access-device",
+            "-f",
+            "IOHID",
+            "--ignore-case",
+            "-o",
+            "hid",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Extract {
+                search,
+                filter,
+                ignore_case,
+                image,
+                output,
+                ..
+            } => {
+                assert_eq!(
+                    search.as_deref(),
+                    Some("com.apple.hid.manager.user-access-device")
+                );
+                assert_eq!(filter.as_deref(), Some("IOHID"));
+                assert!(ignore_case);
+                assert!(image.is_none());
+                assert_eq!(output, Some(PathBuf::from("hid")));
+            }
+            _ => unreachable!(),
+        }
+        assert!(Cli::try_parse_from(["dylex", "extract", "--ignore-case"]).is_err());
+        assert!(
+            Cli::try_parse_from(["dylex", "extract", "-i", "Root", "--search", "needle"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "dylex",
+                "extract",
+                "-i",
+                "Root",
+                "--search",
+                "needle",
+                "--merge-deps"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strings_accepts_a_filter_case_fold_and_all_arches() {
+        let cli = Cli::try_parse_from([
+            "dylex",
+            "strings",
+            "-f",
+            "IOHID",
+            "-i",
+            "--all-arches",
+            "com.apple.hid.manager.user-access-device",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Strings {
+                needle,
+                filter,
+                all_arches,
+                ignore_case,
+                arch,
+                ..
+            } => {
+                assert_eq!(needle, "com.apple.hid.manager.user-access-device");
+                assert_eq!(filter.as_deref(), Some("IOHID"));
+                assert!(all_arches);
+                assert!(ignore_case);
+                assert!(arch.is_empty());
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            Cli::try_parse_from(["dylex", "strings", "--all-arches", "-a", "arm64e", "needle"])
+                .is_err()
+        );
+    }
+
     #[test]
     fn runtime_merge_accepts_explicit_additions_and_a_plan_but_not_recursive_modes() {
         assert!(

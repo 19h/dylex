@@ -21,6 +21,7 @@ dylex extracts Mach-O files for static analysis from Apple's dyld shared cache, 
 - **Rosetta Cache Products** - Discovers native, full Rosetta, and reduced `x86Support` trees separately
 - **Directory Structure Preservation** - Optionally preserves full framework paths
 - **Batch Extraction** - Extract multiple images with filters and parallel processing
+- **String Search** - Find a literal string in cache images, with an optional image filter, in one architecture or every discovered cache. `extract --search` writes every image that contains the string
 
 See [cache compatibility and validation](docs/cache-compatibility.md) for the tested macOS 27 build, older-format fixtures, source provenance, assumptions, and mode limitations.
 
@@ -62,12 +63,38 @@ dylex info -a arm64e
 # List all images containing "UIKit"
 dylex list -a arm64e -f UIKit
 
+# Find images that contain a literal string
+dylex strings -a arm64e -f IOHID com.apple.hid.manager.user-access-device
+
+# Search every image in every discovered architecture cache
+dylex strings --all-arches com.apple.hid.manager.user-access-device
+
 # Extract a single library
 dylex extract -a arm64e -i libobjc.A.dylib -o libobjc.A.dylib
 
 # Extract all MapKit-related frameworks with preserved paths
 dylex extract -a arm64e -f MapKit -o ./extracted
+
+# Extract every image that contains a literal string
+dylex extract -a arm64e --search com.apple.hid.manager.user-access-device -o ./hid
 ```
+
+For an exact x86_64 cache, pass its path as the positional `[CACHE]` argument.
+`-a/--arch` accepts architecture names such as `x86_64`:
+
+```bash
+# Select the reduced Rosetta x86Support cache
+cache=/System/Volumes/Preboot/Cryptexes/Rosetta/System/x86Support/System/Library/dyld/dyld_shared_cache_x86_64
+dylex list "$cache" -f dyld
+dylex extract "$cache" -f dyld -o ./x86_64-dyld
+
+# Extract every image in that cache
+dylex extract "$cache" -f '' -o ./x86_64-all
+```
+
+To select the full Rosetta cache, use
+`/System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/dyld_shared_cache_x86_64`
+instead. When both caches are discovered, `-a x86_64` alone is ambiguous.
 
 ## Commands
 
@@ -85,6 +112,8 @@ Arguments:
 Options:
   -i, --image <IMAGE>           Image to extract (e.g., "UIKit" or full path)
   -f, --filter <FILTER>         Filter images by substring match
+      --search <STRING>         Extract every image that contains this literal string
+      --ignore-case             ASCII case-insensitive --search
   -a, --arch <ARCH>             Architecture (arm64e, arm64, x86_64)
   -o, --output <OUTPUT>         Output path (file or directory)
       --merge-image <IMAGE>    Merge a selected additional image (repeatable)
@@ -109,6 +138,11 @@ dylex extract -a arm64e -i /System/Library/Frameworks/UIKit.framework/UIKit
 
 # Extract all Foundation-related images
 dylex extract -a arm64e -f Foundation -o ./foundation_libs
+
+# Extract every image whose bytes contain the string.
+# --filter limits which images are searched. Output is always a directory.
+dylex extract -a arm64e --search com.apple.hid.manager.user-access-device -o ./hid
+dylex extract -a arm64e -f IOHID --search user-access-device --ignore-case -o ./hid
 
 # Extract everything (warning: large!)
 dylex extract -a arm64e -f "" -o ./all_binaries
@@ -211,6 +245,60 @@ dylex list -a arm64e -f Swift -b
 dylex list -a arm64e -f Framework | wc -l
 ```
 
+### `dylex strings`
+
+Search file-backed bytes of cache images for a literal string. Omit `--filter`
+to search every image. `--arch` selects one architecture and can be repeated.
+`--all-arches` searches every discovered cache, including both Rosetta products.
+With no architecture flag and no cache path, the command uses the same native
+cache default as the other commands.
+
+A segment range mapped by more than one image is skipped. On current caches
+that range is the shared `__LINKEDIT`. Objective-C strings coalesced into a
+single image are reported on that image.
+
+Each match is one line:
+
+```text
+arm64e  /System/Library/Extensions/IOHIDFamily.kext/IOHIDFamily  __TEXT,__cstring  0x180abc000  com.apple.hid.manager.user-access-device
+```
+
+When more than one cache is searched, the cache file name is included after the
+architecture. The address is the start of the enclosing C string when the match
+is an ASCII printable run ending in NUL. A summary is written to stderr.
+
+```
+Usage: dylex strings [OPTIONS] <NEEDLE> [CACHE]
+
+Arguments:
+  <NEEDLE>  Literal string to find
+  [CACHE]   Path to the dyld shared cache (file or directory)
+
+Options:
+  -f, --filter <FILTER>   Only search images whose path contains this substring
+  -a, --arch <ARCH>       Architecture to search, repeatable
+      --all-arches        Search every discovered architecture cache
+  -i, --ignore-case       Compare ASCII letters without regard to case
+  -j, --jobs <N>          Parallel jobs (default: number of CPUs)
+  -h, --help              Print help
+```
+
+#### Examples
+
+```bash
+# One architecture, every image
+dylex strings -a arm64e com.apple.hid.manager.user-access-device
+
+# Only images whose path contains IOHID
+dylex strings -a arm64e -f IOHID com.apple.hid.manager.user-access-device
+
+# Every discovered architecture cache
+dylex strings --all-arches com.apple.hid.manager.user-access-device
+
+# One exact cache file
+dylex strings com.apple.hid.manager.user-access-device /path/to/dyld_shared_cache_arm64e
+```
+
 ### `dylex info`
 
 Display detailed cache information.
@@ -305,7 +393,8 @@ When no cache path is specified, dylex searches these locations in order:
 4. `/var/db/dyld`
 
 Commands without `--arch` retain the native system-cache default. `dylex arches`
-lists each product separately. When `--arch x86` matches both Rosetta caches, an
+lists each product separately. `dylex strings --all-arches` searches every
+discovered product. When `--arch x86` matches both Rosetta caches, an
 exact main-file path selects the product:
 
 ```bash
@@ -451,11 +540,27 @@ dylex info /path/to/cache/directory
 
 ### "Multiple caches match"
 
-Be more specific with the architecture:
+If different architectures match, use a more specific architecture:
 
 ```bash
 # Instead of -a arm64 (matches arm64 and arm64e)
 dylex info -a arm64e
+```
+
+If both caches have the same architecture (e.g., the full and reduced Rosetta
+products), select the exact cache with its positional path:
+
+```bash
+dylex info /System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/dyld_shared_cache_x86_64
+```
+
+### Cache path passed to `-a/--arch`
+
+Move the cache path out of the architecture option:
+
+```bash
+dylex list /path/to/dyld_shared_cache_x86_64 -f dyld
+dylex extract /path/to/dyld_shared_cache_x86_64 -f dyld -o ./x86_64-dyld
 ```
 
 ### Extracted binary won't run
