@@ -50,7 +50,7 @@ pub use converter::{
 };
 pub use dyld::{
     ContainingImages, DyldContext, ImageEntry, MappingEntry, StringHit, StringQuery,
-    StringSearchOutcome,
+    StringSearchOutcome, parse_hex_bytes,
 };
 pub use error::{Error, Result};
 pub use macho::MachOContext;

@@ -1,5 +1,5 @@
 //! String search over a synthetic cache. No Apple binaries are distributed.
-use dylex::{DyldContext, StringQuery, dyld::DyldCacheHeader, macho::*};
+use dylex::{DyldContext, StringQuery, dyld::DyldCacheHeader, macho::*, parse_hex_bytes};
 use std::{fs, mem::size_of, sync::Arc};
 use tempfile::TempDir;
 use zerocopy::IntoBytes;
@@ -269,6 +269,18 @@ fn searches_file_backed_bytes_of_all_images_or_a_filtered_subset() {
     assert!(hello.hits[0].image_path.contains("libsystem_c"));
     assert_eq!(hello.hits[0].address, BASE + 0x16C0);
     assert_eq!(hello.hits[0].text, "hello");
+}
+
+#[test]
+fn hex_needle_finds_the_same_text_as_a_literal_string() {
+    let (_dir, cache) = open_fixture();
+    let hello = parse_hex_bytes("68 65 6c 6c 6f").unwrap();
+    assert_eq!(parse_hex_bytes("68656c6c6f").unwrap(), hello);
+    let found = search(&cache, &hello, None, false);
+    assert_eq!(found.hits.len(), 1);
+    assert!(found.hits[0].image_path.contains("libsystem_c"));
+    assert_eq!(found.hits[0].address, BASE + 0x16C0);
+    assert_eq!(found.hits[0].text, "hello");
 }
 
 #[test]

@@ -21,7 +21,7 @@ dylex extracts Mach-O files for static analysis from Apple's dyld shared cache, 
 - **Rosetta Cache Products** - Discovers native, full Rosetta, and reduced `x86Support` trees separately
 - **Directory Structure Preservation** - Optionally preserves full framework paths
 - **Batch Extraction** - Extract multiple images with filters and parallel processing
-- **String Search** - Find a literal string in cache images, with an optional image filter, in one architecture or every discovered cache. `extract --search` writes every image that contains the string
+- **String Search** - Find a literal string or hex byte sequence in cache images, with an optional image filter, in one architecture or every discovered cache. `extract --search` writes every image that contains the match
 
 See [cache compatibility and validation](docs/cache-compatibility.md) for the tested macOS 27 build, older-format fixtures, source provenance, assumptions, and mode limitations.
 
@@ -66,6 +66,9 @@ dylex list -a arm64e -f UIKit
 # Find images that contain a literal string
 dylex strings -a arm64e -f IOHID com.apple.hid.manager.user-access-device
 
+# Find images that contain a hex byte sequence
+dylex strings -a arm64e -x '63 6f 6d 2e 61 70 70 6c 65'
+
 # Search every image in every discovered architecture cache
 dylex strings --all-arches com.apple.hid.manager.user-access-device
 
@@ -77,6 +80,9 @@ dylex extract -a arm64e -f MapKit -o ./extracted
 
 # Extract every image that contains a literal string
 dylex extract -a arm64e --search com.apple.hid.manager.user-access-device -o ./hid
+
+# Extract every image that contains a hex byte sequence
+dylex extract -a arm64e --hex --search '63 6f 6d 2e 61 70 70 6c 65' -o ./hid
 ```
 
 For an exact x86_64 cache, pass its path as the positional `[CACHE]` argument.
@@ -112,7 +118,8 @@ Arguments:
 Options:
   -i, --image <IMAGE>           Image to extract (e.g., "UIKit" or full path)
   -f, --filter <FILTER>         Filter images by substring match
-      --search <STRING>         Extract every image that contains this literal string
+      --search <STRING>         Extract every image that contains this string or hex bytes
+  -x, --hex                     Interpret --search as hex bytes
       --ignore-case             ASCII case-insensitive --search
   -a, --arch <ARCH>             Architecture (arm64e, arm64, x86_64)
   -o, --output <OUTPUT>         Output path (file or directory)
@@ -143,6 +150,7 @@ dylex extract -a arm64e -f Foundation -o ./foundation_libs
 # --filter limits which images are searched. Output is always a directory.
 dylex extract -a arm64e --search com.apple.hid.manager.user-access-device -o ./hid
 dylex extract -a arm64e -f IOHID --search user-access-device --ignore-case -o ./hid
+dylex extract -a arm64e --hex --search '63 6f 6d 2e 61 70 70 6c 65' -o ./hid
 
 # Extract everything (warning: large!)
 dylex extract -a arm64e -f "" -o ./all_binaries
@@ -247,8 +255,11 @@ dylex list -a arm64e -f Framework | wc -l
 
 ### `dylex strings`
 
-Search file-backed bytes of cache images for a literal string. Omit `--filter`
-to search every image. `--arch` selects one architecture and can be repeated.
+Search file-backed bytes of cache images for a literal string. `--hex` reads
+the needle as bytes instead: `deadbeef`, `de ad be ef`, `0xde:ad`, and
+`\xde\xad` are the same four bytes. Quote a needle that contains spaces.
+Omit `--filter` to search every image. `--arch` selects one architecture and
+can be repeated.
 `--all-arches` searches every discovered cache, including both Rosetta products.
 With no architecture flag and no cache path, the command uses the same native
 cache default as the other commands.
@@ -271,10 +282,11 @@ is an ASCII printable run ending in NUL. A summary is written to stderr.
 Usage: dylex strings [OPTIONS] <NEEDLE> [CACHE]
 
 Arguments:
-  <NEEDLE>  Literal string to find
+  <NEEDLE>  Literal string to find, or hex bytes with --hex
   [CACHE]   Path to the dyld shared cache (file or directory)
 
 Options:
+  -x, --hex               Interpret the needle as hex bytes
   -f, --filter <FILTER>   Only search images whose path contains this substring
   -a, --arch <ARCH>       Architecture to search, repeatable
       --all-arches        Search every discovered architecture cache
@@ -294,6 +306,10 @@ dylex strings -a arm64e -f IOHID com.apple.hid.manager.user-access-device
 
 # Every discovered architecture cache
 dylex strings --all-arches com.apple.hid.manager.user-access-device
+
+# Hex bytes. Spaces, colons, dashes, and 0x prefixes are optional
+dylex strings -a arm64e -x '63 6f 6d 2e 61 70 70 6c 65'
+dylex strings -a arm64e --hex 0xdeadbeef
 
 # One exact cache file
 dylex strings com.apple.hid.manager.user-access-device /path/to/dyld_shared_cache_arm64e

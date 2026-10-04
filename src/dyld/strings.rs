@@ -1,4 +1,4 @@
-//! Literal string search across images in a dyld shared cache.
+//! Literal string and hex byte search across images in a dyld shared cache.
 
 use std::collections::{HashMap, HashSet};
 
@@ -60,6 +60,79 @@ pub struct ContainingImages {
     pub images: Vec<ImageEntry>,
     /// `path: reason` for images whose Mach-O headers could not be read.
     pub skipped: Vec<String>,
+}
+
+/// Decodes a hex byte string into the bytes [`StringQuery::needle`] searches for.
+///
+/// Separators (whitespace, `:`, `,`, `-`, `_`, `.`) are ignored. `0x` / `0X`
+/// prefixes and `\x` escapes are accepted. Digits are paired from the left.
+pub fn parse_hex_bytes(input: &str) -> Result<Vec<u8>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut pending = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let current = bytes[index];
+        if is_hex_separator(current) {
+            index += 1;
+            continue;
+        }
+        if current == b'\\' && bytes.get(index + 1) == Some(&b'x') {
+            if !bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit) {
+                return Err(hex_error(index, "incomplete hex escape"));
+            }
+            index += 2;
+            continue;
+        }
+        if current == b'0' && matches!(bytes.get(index + 1), Some(b'x' | b'X')) {
+            if !bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit) {
+                return Err(hex_error(index, "incomplete hex prefix"));
+            }
+            index += 2;
+            continue;
+        }
+        let Some(nibble) = hex_nibble(current) else {
+            return Err(hex_error(
+                index,
+                &format!("invalid hex digit '{}'", current as char),
+            ));
+        };
+        match pending {
+            None => pending = Some(nibble),
+            Some(high) => {
+                out.push((high << 4) | nibble);
+                pending = None;
+            }
+        }
+        index += 1;
+    }
+    if out.is_empty() && pending.is_none() {
+        return Err(hex_error(0, "hex search is empty"));
+    }
+    if pending.is_some() {
+        return Err(hex_error(0, "hex byte string has an odd number of digits"));
+    }
+    Ok(out)
+}
+
+fn is_hex_separator(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b':' | b',' | b'-' | b'_' | b'.')
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_error(offset: usize, reason: &str) -> Error {
+    Error::Parse {
+        offset,
+        reason: reason.to_string(),
+    }
 }
 
 /// Tail of the previous mapped slice, used to match a string that crosses slices.
@@ -540,6 +613,45 @@ mod tests {
         remember_tail(&mut gapped, head, 0, head.len() as u64, 4);
         across_gap.extend(matches_in_slice(b"z", 10, b"wxyz", false, &gapped, false));
         assert!(across_gap.is_empty());
+    }
+
+    #[test]
+    fn parses_hex_byte_strings() {
+        let expected = [0xde, 0xad, 0xbe, 0xef];
+        for sample in [
+            "deadbeef",
+            "DE AD BE EF",
+            "0xdeadbeef",
+            "0xde:ad-be_ef",
+            "de.ad,be ef",
+            r"\xde\xad\xbe\xef",
+        ] {
+            assert_eq!(parse_hex_bytes(sample).unwrap(), expected, "{sample}");
+        }
+        assert!(
+            parse_hex_bytes("   ")
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
+        assert!(
+            parse_hex_bytes("abc")
+                .unwrap_err()
+                .to_string()
+                .contains("odd")
+        );
+        assert!(
+            parse_hex_bytes("zz")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid hex")
+        );
+        assert!(
+            parse_hex_bytes("0x")
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
     }
 
     #[test]

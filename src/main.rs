@@ -56,6 +56,7 @@ enum Commands {
         filter: Option<String>,
 
         /// Extract every image that contains this literal string.
+        /// With --hex, a byte sequence such as "de ad be ef" or "deadbeef".
         /// Combines with --filter. A range mapped by more than one image is not searched.
         #[arg(
             long,
@@ -63,6 +64,10 @@ enum Commands {
             conflicts_with_all = ["merge_deps", "merge_images", "merge_runtime", "merge_plan"]
         )]
         search: Option<String>,
+
+        /// Interpret --search as hex bytes. Requires --search.
+        #[arg(long, short = 'x', requires = "search")]
+        hex: bool,
 
         /// Compare ASCII letters without regard to case. Requires --search.
         #[arg(long, requires = "search")]
@@ -153,10 +158,15 @@ enum Commands {
         cache: Option<PathBuf>,
     },
 
-    /// Search images for a literal string
+    /// Search images for a literal string or a hex byte sequence
     Strings {
-        /// Literal string to find, such as com.apple.hid.manager.user-access-device
+        /// Literal string to find, such as com.apple.hid.manager.user-access-device.
+        /// With --hex, a byte sequence such as "de ad be ef" or "deadbeef".
         needle: String,
+
+        /// Interpret the needle as hex bytes
+        #[arg(long, short = 'x')]
+        hex: bool,
 
         /// Only search images whose path contains this substring.
         /// Omit to search every image.
@@ -252,6 +262,7 @@ fn main() -> Result<()> {
             image,
             filter,
             search,
+            hex,
             ignore_case,
             arch,
             output,
@@ -272,6 +283,7 @@ fn main() -> Result<()> {
                 image,
                 filter,
                 search,
+                hex,
                 ignore_case,
                 arch,
                 output,
@@ -297,12 +309,22 @@ fn main() -> Result<()> {
         Commands::Strings {
             cache,
             needle,
+            hex,
             filter,
             arch,
             all_arches,
             ignore_case,
             jobs,
-        } => cmd_strings(cache, needle, filter, arch, all_arches, ignore_case, jobs),
+        } => cmd_strings(
+            cache,
+            needle,
+            hex,
+            filter,
+            arch,
+            all_arches,
+            ignore_case,
+            jobs,
+        ),
         Commands::Info { cache, arch } => cmd_info(cache, arch),
         Commands::Arches { path } => cmd_arches(path),
         Commands::Lookup {
@@ -568,9 +590,22 @@ fn image_to_output_path(image_path: &str, preserve_paths: bool) -> PathBuf {
     }
 }
 
+fn search_needle(query: &str, hex: bool) -> Result<Vec<u8>> {
+    if hex {
+        dylex::parse_hex_bytes(query).map_err(|err| match err {
+            dylex::Error::Parse { reason, .. } => anyhow::anyhow!(reason),
+            other => other.into(),
+        })
+    } else if query.is_empty() {
+        bail!("search string is empty");
+    } else {
+        Ok(query.as_bytes().to_vec())
+    }
+}
+
 fn images_containing_query(
     cache: &DyldContext,
-    query: &str,
+    needle: &[u8],
     filter: Option<&str>,
     ignore_case: bool,
     jobs: Option<usize>,
@@ -599,7 +634,7 @@ fn images_containing_query(
     }
     let found = cache.images_containing(
         &StringQuery {
-            needle: query.as_bytes().to_vec(),
+            needle: needle.to_vec(),
             ignore_case,
             image_filter: filter.map(str::to_string),
         },
@@ -626,6 +661,7 @@ fn cmd_extract(
     image: Option<String>,
     filter: Option<String>,
     search: Option<String>,
+    hex: bool,
     ignore_case: bool,
     arch: Option<String>,
     output: Option<PathBuf>,
@@ -641,9 +677,10 @@ fn cmd_extract(
     merge_depth: usize,
 ) -> Result<()> {
     let start = Instant::now();
-    if search.as_ref().is_some_and(|query| query.is_empty()) {
-        bail!("search string is empty");
-    }
+    let needle = match search.as_deref() {
+        Some(query) => Some(search_needle(query, hex)?),
+        None => None,
+    };
     if merge_plan && !merge_runtime && merge_images.is_empty() {
         anyhow::bail!("--merge-plan requires --merge-runtime or --merge-image");
     }
@@ -746,9 +783,9 @@ fn cmd_extract(
     }
 
     // Determine what to extract
-    let from_search = search.is_some();
-    let images_to_extract: Vec<_> = if let Some(ref query) = search {
-        images_containing_query(&cache, query, filter.as_deref(), ignore_case, jobs)?
+    let from_search = needle.is_some();
+    let images_to_extract: Vec<_> = if let Some(ref bytes) = needle {
+        images_containing_query(&cache, bytes, filter.as_deref(), ignore_case, jobs)?
     } else if let Some(ref img_name) = image {
         // Single image mode
         let img = cache
@@ -1014,15 +1051,14 @@ fn cmd_list(
 fn cmd_strings(
     cache: Option<PathBuf>,
     needle: String,
+    hex: bool,
     filter: Option<String>,
     arches: Vec<String>,
     all_arches: bool,
     ignore_case: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
-    if needle.is_empty() {
-        bail!("search string is empty");
-    }
+    let needle = search_needle(&needle, hex)?;
     if jobs == Some(0) {
         bail!("--jobs must be at least 1");
     }
@@ -1036,7 +1072,7 @@ fn cmd_strings(
     let caches = resolve_search_caches(cache, &arches, all_arches)?;
     let labels = cache_labels(&caches);
     let query = StringQuery {
-        needle: needle.into_bytes(),
+        needle,
         ignore_case,
         image_filter: filter.clone(),
     };
@@ -1584,6 +1620,42 @@ mod selection_cli_tests {
             Cli::try_parse_from(["dylex", "strings", "--all-arches", "-a", "arm64e", "needle"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn hex_search_is_a_flag_on_strings_and_requires_a_query_for_extract() {
+        let cli = Cli::try_parse_from(["dylex", "strings", "-x", "de ad be ef"]).unwrap();
+        match cli.command {
+            Commands::Strings { needle, hex, .. } => {
+                assert!(hex);
+                assert_eq!(needle, "de ad be ef");
+            }
+            _ => unreachable!(),
+        }
+        let extract = Cli::try_parse_from([
+            "dylex",
+            "extract",
+            "--hex",
+            "--search",
+            "0xdeadbeef",
+            "-f",
+            "IOHID",
+        ])
+        .unwrap();
+        match extract.command {
+            Commands::Extract {
+                search,
+                hex,
+                filter,
+                ..
+            } => {
+                assert!(hex);
+                assert_eq!(search.as_deref(), Some("0xdeadbeef"));
+                assert_eq!(filter.as_deref(), Some("IOHID"));
+            }
+            _ => unreachable!(),
+        }
+        assert!(Cli::try_parse_from(["dylex", "extract", "--hex"]).is_err());
     }
 
     #[test]
