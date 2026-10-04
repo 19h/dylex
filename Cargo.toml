@@ -1,13 +1,13 @@
 [package]
 name = "dylex"
-version = "2.3.0"
+version = "2.3.1"
 edition = "2024"
 authors = ["dylex contributors"]
 description = "A high-performance dyld shared cache extractor for macOS and iOS"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/anomalyco/dylex"
-homepage = "https://github.com/anomalyco/dylex"
+repository = "https://github.com/19h/dylex"
+homepage = "https://github.com/19h/dylex"
 documentation = "https://docs.rs/dylex"
 keywords = ["dyld", "macho", "ios", "macos", "reverse-engineering"]
 categories = ["command-line-utilities", "development-tools", "parsing"]
