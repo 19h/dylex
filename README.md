@@ -63,6 +63,9 @@ dylex info -a arm64e
 # List all images containing "UIKit"
 dylex list -a arm64e -f UIKit
 
+# Locate a file across every cache, including DriverKit and staged updates
+dylex find libobjc.A.dylib --exact
+
 # Find images that contain a literal string
 dylex strings -a arm64e -f IOHID com.apple.hid.manager.user-access-device
 
@@ -398,6 +401,53 @@ Options:
   -a, --arch <ARCH>   Architecture to use
   -h, --help          Print help
 ```
+
+## Find files across caches
+
+`find` searches image paths in every cache from all default locations, including
+OS, DriverKit, Incoming updates, and both Rosetta products. It does not apply the
+single-cache preference used by `info`, `list`, and `extract`. Each output row
+contains the architecture, main cache path, and image path, separated by tabs.
+
+```bash
+# Exact filename across all caches
+dylex find libobjc.A.dylib --exact
+
+# Image path substring; optional architecture filter and ASCII case folding
+dylex find UIKit -a arm -i
+
+# Exact full image path, limited to a supplied cache directory
+dylex find /usr/lib/libobjc.A.dylib --exact /path/to/caches
+
+# Search the disk for additional caches, then find the file in all results
+dylex find libobjc.A.dylib --exact --scan-disk
+
+# Limit the recursive scan to selected directories; --scan-disk is implied
+dylex find libobjc.A.dylib --exact --scan-root /Volumes/Research --scan-root ~/Downloads
+
+# Discover additional caches without searching their image tables
+dylex arches --scan-disk
+dylex arches --scan-root /Volumes/Research
+```
+
+By default, queries are case-sensitive substrings of the complete image path.
+`--exact` matches the basename when the query contains no `/`, and the full image
+path otherwise. Repeat `-a` to include multiple architecture filters. No matches
+returns success; an empty query or no eligible caches returns an error. If a cache
+cannot be opened, other caches are still searched and the command exits with an
+error identifying the incomplete search.
+
+Disk scanning is opt-in and adds to the normal cache locations (or positional
+cache file/directory). `--scan-disk` scans recursively from `/`; repeatable
+`--scan-root` replaces that disk-scan root and can also be used alone. Unlike the
+normal discovery depth limit, disk scans have no depth limit. They skip symlinks,
+recognize main cache filenames and magic, exclude numbered subcaches and symbol
+files, and deduplicate overlapping roots and filesystem aliases. Unreadable
+directories/entries are skipped with an incompleteness count. Disk-wide scans can
+take time and visit mounted volumes; use `--scan-root` to constrain traversal.
+Discovery validates cache magic; `find` additionally opens each cache and reads
+its image table. It searches files represented by cache images, rather than
+arbitrary non-image files on disk.
 
 ## Default Cache Locations
 

@@ -2,6 +2,7 @@
 //!
 //! Extract individual dylibs or all frameworks from Apple's dyld shared cache.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use tracing::{Level, error, info, warn};
@@ -42,6 +43,17 @@ const DEFAULT_CACHE_PATHS: &[&str] = &[
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Args, Debug, Default)]
+struct DiskScan {
+    /// Recursively search the disk for additional caches (default root: /)
+    #[arg(long)]
+    scan_disk: bool,
+
+    /// Search this directory recursively instead of /; repeat for multiple roots
+    #[arg(long, value_name = "DIRECTORY")]
+    scan_root: Vec<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -216,6 +228,33 @@ enum Commands {
         /// Path to the dyld shared cache directory.
         /// If not specified, searches default system locations.
         path: Option<PathBuf>,
+
+        #[command(flatten)]
+        scan: DiskScan,
+    },
+
+    /// Find image filenames or paths across all caches, including staged/DriverKit caches
+    Find {
+        /// Case-sensitive substring of an image path (use --exact for a filename/path)
+        query: String,
+
+        /// Match the exact basename, or full image path if QUERY contains /
+        #[arg(long)]
+        exact: bool,
+
+        /// Compare ASCII letters without regard to case
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+
+        /// Restrict architectures; repeatable (e.g. -a arm -a x86)
+        #[arg(short, long, value_parser = parse_arch)]
+        arch: Vec<String>,
+
+        /// Cache file or directory; omit to search all default locations
+        cache: Option<PathBuf>,
+
+        #[command(flatten)]
+        scan: DiskScan,
     },
 
     /// Lookup which image contains an address
@@ -329,7 +368,15 @@ fn main() -> Result<()> {
             jobs,
         ),
         Commands::Info { cache, arch } => cmd_info(cache, arch),
-        Commands::Arches { path } => cmd_arches(path),
+        Commands::Arches { path, scan } => cmd_arches(path, scan),
+        Commands::Find {
+            query,
+            exact,
+            ignore_case,
+            arch,
+            cache,
+            scan,
+        } => cmd_find(cache, scan, &query, exact, ignore_case, &arch),
         Commands::Lookup {
             cache,
             arch,
@@ -405,6 +452,145 @@ fn architecture_of(path: &Path) -> Result<String> {
     arch_from_magic(&magic).with_context(|| format!("Not a dyld shared cache: {}", path.display()))
 }
 
+fn cache_info(path: PathBuf) -> Option<CacheInfo> {
+    let name = path.file_name()?.to_str()?;
+    if !name.starts_with("dyld_shared_cache_")
+        || (name.contains('.') && !name.ends_with(".development"))
+    {
+        return None;
+    }
+    let arch = architecture_of(&path).ok()?;
+    Some(CacheInfo { path, arch })
+}
+
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = PathBuf;
+
+fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::canonicalize(path)
+    }
+}
+
+/// Full disk traversal: O(E + C log C) time and O(D + C) space for E entries,
+/// D directories and C caches. Directory links are not followed. Directory/file
+/// identities suppress overlapping roots, hard links and macOS volume aliases.
+fn scan_disk_caches(roots: &[PathBuf]) -> Result<Vec<CacheInfo>> {
+    for root in roots {
+        if !root.is_dir() {
+            bail!("Scan root is not a directory: {}", root.display());
+        }
+    }
+    let mut pending = roots.to_vec();
+    let mut visited = HashSet::new();
+    let mut caches = Vec::new();
+    let mut skipped = 0usize;
+    while let Some(directory) = pending.pop() {
+        let identity = match file_identity(&directory) {
+            Ok(identity) => identity,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if !visited.insert(identity) {
+            continue;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let ty = match entry.file_type() {
+                Ok(ty) => ty,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if ty.is_dir() {
+                pending.push(entry.path());
+            } else if ty.is_file() {
+                if let Some(cache) = cache_info(entry.path()) {
+                    caches.push(cache);
+                }
+            }
+        }
+    }
+    if skipped != 0 {
+        eprintln!(
+            "Disk scan skipped {skipped} unreadable directories or entries; results may be incomplete."
+        );
+    }
+    Ok(caches)
+}
+
+/// Gather every default location, rather than stopping at the first product.
+fn collect_caches(path: Option<PathBuf>, scan: &DiskScan) -> Result<Vec<CacheInfo>> {
+    let mut caches = Vec::new();
+    let explicit = path.is_some();
+    let roots = match path {
+        Some(path) => vec![path],
+        None => DEFAULT_CACHE_PATHS
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .collect(),
+    };
+    for root in roots {
+        if root.is_file() {
+            caches.push(CacheInfo {
+                arch: architecture_of(&root)?,
+                path: root,
+            });
+        } else {
+            match discover_caches(&root) {
+                Ok(found) => caches.extend(found),
+                Err(error) if explicit => {
+                    bail!("Failed to discover caches in {}: {error}", root.display())
+                }
+                Err(error) => eprintln!("Could not fully search {}: {error}", root.display()),
+            }
+        }
+    }
+    if scan.scan_disk || !scan.scan_root.is_empty() {
+        let roots = if scan.scan_root.is_empty() {
+            vec![PathBuf::from("/")]
+        } else {
+            scan.scan_root.clone()
+        };
+        caches.extend(scan_disk_caches(&roots)?);
+    }
+    caches.sort_by(|a, b| a.arch.cmp(&b.arch).then(a.path.cmp(&b.path)));
+    let mut seen = HashSet::new();
+    caches.retain(|cache| {
+        seen.insert(file_identity(&cache.path).map_or_else(
+            |_| (None, Some(cache.path.clone())),
+            |identity| (Some(identity), None),
+        ))
+    });
+    Ok(caches)
+}
+
 /// Discovers all dyld shared cache files in a directory.
 fn discover_caches(dir: &Path) -> Result<Vec<CacheInfo>> {
     let mut caches = Vec::new();
@@ -427,24 +613,9 @@ fn discover_caches(dir: &Path) -> Result<Vec<CacheInfo>> {
             if !ty.is_file() {
                 continue;
             }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("dyld_shared_cache_") {
-                continue;
+            if let Some(cache) = cache_info(path) {
+                caches.push(cache);
             }
-            if name.contains('.') && !name.ends_with(".development") {
-                continue;
-            }
-            let mut magic = [0u8; 16];
-            if fs::File::open(&path)
-                .and_then(|mut f| f.read_exact(&mut magic))
-                .is_err()
-            {
-                continue;
-            }
-            let Some(arch) = arch_from_magic(&magic) else {
-                continue;
-            };
-            caches.push(CacheInfo { path, arch });
         }
     }
     caches.sort_by(|a, b| a.arch.cmp(&b.arch).then(a.path.cmp(&b.path)));
@@ -1300,20 +1471,91 @@ fn cmd_info(cache: Option<PathBuf>, arch: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_arches(path: Option<PathBuf>) -> Result<()> {
-    let cache_path = get_cache_path(path)?;
-    let caches = discover_caches(&cache_path)?;
+fn cmd_arches(path: Option<PathBuf>, scan: DiskScan) -> Result<()> {
+    let label = path.as_deref().map_or_else(
+        || "default locations".to_string(),
+        |path| path.display().to_string(),
+    );
+    let caches = collect_caches(path, &scan)?;
 
     if caches.is_empty() {
-        println!("No dyld shared caches found in: {}", cache_path.display());
+        println!("No dyld shared caches found in: {label}");
         return Ok(());
     }
 
-    println!("Available architectures in {}:", cache_path.display());
+    println!("Available architectures in {label} (including any disk scan):");
     for cache in &caches {
         println!("  {} - {}", cache.arch, cache.path.display());
     }
 
+    Ok(())
+}
+
+fn image_path_matches(path: &str, query: &str, exact: bool, ignore_case: bool) -> bool {
+    let candidate = if exact && !query.contains('/') {
+        path.rsplit('/').next().unwrap_or(path)
+    } else {
+        path
+    };
+    if exact {
+        if ignore_case {
+            candidate.eq_ignore_ascii_case(query)
+        } else {
+            candidate == query
+        }
+    } else if ignore_case {
+        candidate
+            .to_ascii_lowercase()
+            .contains(&query.to_ascii_lowercase())
+    } else {
+        candidate.contains(query)
+    }
+}
+
+fn cmd_find(
+    path: Option<PathBuf>,
+    scan: DiskScan,
+    query: &str,
+    exact: bool,
+    ignore_case: bool,
+    arches: &[String],
+) -> Result<()> {
+    if query.is_empty() {
+        bail!("File query must not be empty");
+    }
+    let caches: Vec<_> = collect_caches(path, &scan)?
+        .into_iter()
+        .filter(|cache| arches.is_empty() || arches.iter().any(|arch| cache.arch.contains(arch)))
+        .collect();
+    if caches.is_empty() {
+        bail!("No dyld shared caches found matching the requested locations and architectures");
+    }
+    let mut matches = 0usize;
+    let mut failed = 0usize;
+    println!("Architecture\tCache\tImage");
+    for info in &caches {
+        let cache = match DyldContext::open(&info.path) {
+            Ok(cache) => cache,
+            Err(error) => {
+                eprintln!("Failed to open {}: {error}", info.path.display());
+                failed += 1;
+                continue;
+            }
+        };
+        for image in cache.iter_images() {
+            if image_path_matches(&image.path, query, exact, ignore_case) {
+                println!("{}\t{}\t{}", info.arch, info.path.display(), image.path);
+                matches += 1;
+            }
+        }
+    }
+    eprintln!(
+        "Found {matches} matching images in {} successfully opened caches.",
+        caches.len() - failed
+    );
+    if failed != 0 {
+        bail!("Search incomplete: failed to open {failed} cache(s)");
+    }
     Ok(())
 }
 
@@ -1417,6 +1659,47 @@ mod discovery_tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, magic).unwrap();
         path
+    }
+    #[test]
+    fn disk_scan_finds_deep_caches_and_deduplicates_overlapping_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let relative = "a/b/c/d/e/f/g/h/i/j/dyld_shared_cache_arm64e";
+        let expected = cache(dir.path(), relative, b"dyld_v1  arm64e\0");
+        cache(dir.path(), &format!("{relative}.01"), b"dyld_v1  arm64e\0");
+        cache(dir.path(), "dyld_shared_cache_invalid", b"not a cache");
+        fs::hard_link(&expected, dir.path().join("dyld_shared_cache_link")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("cycle")).unwrap();
+        assert!(
+            scan_disk_caches(&[dir.path().to_path_buf()])
+                .unwrap()
+                .iter()
+                .any(|c| c.path == expected)
+        );
+        let caches = collect_caches(
+            Some(dir.path().to_path_buf()),
+            &DiskScan {
+                scan_disk: false,
+                scan_root: vec![dir.path().to_path_buf(), dir.path().join("a")],
+            },
+        )
+        .unwrap();
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].arch, "arm64e");
+        assert!(scan_disk_caches(&[dir.path().join("missing")]).is_err());
+    }
+
+    #[test]
+    fn file_queries_distinguish_substrings_basenames_and_full_paths() {
+        let path = "/usr/lib/system/libdyld.dylib";
+        assert!(image_path_matches(path, "dyld", false, false));
+        assert!(!image_path_matches(path, "DYLD", false, false));
+        assert!(image_path_matches(path, "DYLD", false, true));
+        assert!(image_path_matches(path, "libdyld.dylib", true, false));
+        assert!(!image_path_matches(path, "dyld", true, false));
+        assert!(image_path_matches(path, path, true, false));
+        assert!(!image_path_matches(path, "/libdyld.dylib", true, false));
+        assert!(image_path_matches(path, "LIBDYLD.DYLIB", true, true));
     }
     #[test]
     fn separate_rosetta_products_remain_distinct_and_explicitly_selectable() {
@@ -1604,7 +1887,9 @@ mod selection_cli_tests {
                 | Commands::List { arch, cache, .. }
                 | Commands::Info { arch, cache }
                 | Commands::Lookup { arch, cache, .. } => (arch, cache),
-                Commands::Strings { .. } | Commands::Arches { .. } => unreachable!(),
+                Commands::Strings { .. } | Commands::Arches { .. } | Commands::Find { .. } => {
+                    unreachable!()
+                }
             };
             assert_eq!(arch.as_deref(), Some("x86_64"));
             assert_eq!(cache, Some(PathBuf::from(path)));
