@@ -312,6 +312,8 @@ pub const N_UNDF: u8 = 0x0;
 pub const N_ABS: u8 = 0x2;
 /// Defined in section number n_sect
 pub const N_SECT: u8 = 0xE;
+/// ARM symbol denotes Thumb instructions (Mach-O n_desc).
+pub const N_ARM_THUMB_DEF: u16 = 0x0008;
 /// Prebound undefined
 pub const N_PBUD: u8 = 0xC;
 /// Indirect

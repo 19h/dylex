@@ -25,6 +25,7 @@ mod lookup;
 mod objc;
 mod strings;
 mod structs;
+mod symbols;
 pub mod trie;
 
 pub use context::*;
@@ -32,4 +33,7 @@ pub use lookup::*;
 pub use objc::*;
 pub use strings::*;
 pub use structs::*;
+pub use symbols::*;
 pub use trie::*;
+
+pub(crate) use objc::decode_slide_pointer;

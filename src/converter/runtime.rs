@@ -1,5 +1,5 @@
 //! Infer directly referenced runtime images without dependency-graph traversal.
-use crate::{DyldContext, Error, Result, arm64, macho::*};
+use crate::{DyldContext, Error, MachOContext, Result, arm64, macho::*};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Evidence for one directly referenced runtime image.
@@ -162,7 +162,8 @@ fn resolve_target(
                 return Ok(None);
             };
             let size = (mapping.size - (address - mapping.address)).min(16) as usize;
-            let Some(stub) = super::decode_cache_stub(cache.data_at_addr(address, size)?, address)
+            let Some(stub) =
+                super::decode_stub_for_cache(cache, cache.data_at_addr(address, size)?, address)
             else {
                 return Ok(None);
             };
@@ -193,9 +194,69 @@ fn pointer_section(section: &Section64) -> bool {
     )
 }
 
+// Mode evidence comes from mapped and omitted Mach-O symbols, never a blanket
+// assumption that every ARMv7 instruction section contains Thumb code.
+fn arm_code_modes(
+    cache: &DyldContext,
+    header: &MachOContext,
+    address: u64,
+) -> Result<BTreeMap<u64, bool>> {
+    let mut symbols = Vec::new();
+    if let Some(table) = header.symtab().filter(|s| s.nsyms != 0) {
+        let link = header
+            .linkedit_segment()
+            .ok_or_else(|| invalid("ARM symbols without LINKEDIT"))?;
+        let size = table
+            .nsyms
+            .checked_mul(12)
+            .ok_or_else(|| invalid("ARM symbol table overflow"))? as u64;
+        let delta = (table.symoff as u64)
+            .checked_sub(link.command.fileoff)
+            .filter(|d| {
+                d.checked_add(size)
+                    .is_some_and(|end| end <= link.command.filesize)
+            })
+            .ok_or_else(|| invalid("ARM symbols outside LINKEDIT"))?;
+        for raw in cache
+            .data_at_addr(link.command.vmaddr + delta, size as usize)?
+            .chunks_exact(12)
+        {
+            symbols.push(read_nlist(raw, false)?);
+        }
+    }
+    symbols.extend(
+        cache
+            .local_symbols_for_image(address)?
+            .into_iter()
+            .map(|s| s.entry),
+    );
+    let sections: Vec<_> = header.segments().flat_map(|s| &s.sections).collect();
+    let mut modes = BTreeMap::new();
+    for symbol in symbols {
+        if symbol.n_type & N_STAB != 0 || symbol.n_type & N_TYPE != N_SECT || symbol.n_sect == 0 {
+            continue;
+        }
+        let Some(section) = sections.get(symbol.n_sect as usize - 1) else {
+            continue;
+        };
+        let s = &section.section;
+        let pc = symbol.n_value & !1;
+        if s.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0
+            && pc >= s.addr
+            && pc - s.addr < s.size
+        {
+            modes.insert(
+                pc,
+                symbol.n_desc & N_ARM_THUMB_DEF != 0 || symbol.n_value & 1 != 0,
+            );
+        }
+    }
+    Ok(modes)
+}
+
 /// Infer runtime additions from the primary and explicitly selected images.
-/// Scans ARM64 B/BL instructions (excluding LC_DATA_IN_CODE spans), and declared
-/// pointer sections on all supported 64-bit architectures. Follows recognized
+/// Scans ARM64 B/BL and symbol-mode-identified ARM/Thumb B/BL/BLX instructions
+/// (excluding LC_DATA_IN_CODE spans), and declared pointer sections. Follows recognized
 /// stubs for at most 64 hops. Newly inferred images are not scanned recursively.
 /// Computed/register-only targets without static pointer evidence remain unknown.
 pub fn referenced_runtime_images(
@@ -204,7 +265,14 @@ pub fn referenced_runtime_images(
 ) -> Result<Vec<RuntimeImageReference>> {
     let mut root_indexes = HashSet::new();
     for root in roots {
-        root_indexes.insert(cache.resolve_image(root)?.index);
+        let address = cache.resolve_image(root)?.address;
+        root_indexes.extend(
+            cache
+                .images
+                .iter()
+                .filter(|image| image.address == address)
+                .map(|image| image.index),
+        );
     }
     let ownership = Ownership::new(cache)?;
     let mut results = BTreeMap::<String, RuntimeImageReference>::new();
@@ -213,6 +281,11 @@ pub fn referenced_runtime_images(
     for root in roots {
         let image = cache.resolve_image(root)?;
         let header = cache.image_header(image.address)?;
+        let arm_modes = if header.header.cputype == CPU_TYPE_ARM {
+            arm_code_modes(cache, &header, image.address)?
+        } else {
+            BTreeMap::new()
+        };
         let mut excluded = Vec::new();
         for lc in &header.load_commands {
             if let LoadCommandInfo::LinkeditData { command: c, .. } = lc {
@@ -296,12 +369,55 @@ pub fn referenced_runtime_images(
                         .is_some_and(|e| e <= segment.command.filesize)
                 });
                 if pointer_section(s) {
-                    if delta.is_none() || s.size % 8 != 0 || s.addr % 8 != 0 {
+                    if delta.is_none()
+                        || s.size % header.pointer_size() as u64 != 0
+                        || s.addr % header.pointer_size() as u64 != 0
+                    {
                         return Err(invalid("invalid pointer section extent/alignment"));
                     }
-                    for offset in (0..s.size).step_by(8) {
+                    for offset in (0..s.size).step_by(header.pointer_size()) {
                         let address = s.addr + offset;
                         record(address, cache.pointer_at(address)?)?;
+                    }
+                } else if header.header.cputype == CPU_TYPE_ARM
+                    && s.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0
+                {
+                    if delta.is_none() {
+                        return Err(invalid(
+                            "ARM instruction section outside file-backed segment",
+                        ));
+                    }
+                    let data = cache.data_at_addr(s.addr, s.size as usize)?;
+                    let modes: Vec<_> = arm_modes
+                        .range(s.addr..s.addr + s.size)
+                        .map(|(&pc, &thumb)| (pc, thumb))
+                        .collect();
+                    for (i, &(start, thumb)) in modes.iter().enumerate() {
+                        let end = modes.get(i + 1).map_or(s.addr + s.size, |(pc, _)| *pc);
+                        let mut pc = start;
+                        while pc < end {
+                            let off = (pc - s.addr) as usize;
+                            let rest = &data[off..(end - s.addr) as usize];
+                            let size = if thumb {
+                                crate::arm::thumb_instruction_size(rest)
+                            } else {
+                                (rest.len() >= 4).then_some(4)
+                            };
+                            let Some(size) = size else {
+                                break;
+                            };
+                            if !excluded
+                                .iter()
+                                .any(|&(a, b)| pc < b && pc + size as u64 > a)
+                            {
+                                if let Some(target) =
+                                    crate::arm::branch_target(rest, pc as u32, thumb)
+                                {
+                                    record(pc, target as u64)?;
+                                }
+                            }
+                            pc += size as u64;
+                        }
                     }
                 } else if cache.architecture().starts_with("arm64")
                     && s.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0

@@ -230,6 +230,9 @@ impl SymbolPointerSectionInfo {
 /// 3. Detects optimized stubs that branch directly to targets
 /// 4. Rewrites optimized stubs to use the normal format through symbol pointers
 pub fn fix_stubs(ctx: &mut ExtractionContext) -> Result<()> {
+    if ctx.macho.header.cputype == crate::macho::CPU_TYPE_ARM {
+        return fix_arm_stubs(ctx);
+    }
     if !ctx.macho.is_arm64() {
         ctx.info("Skipping stub fixing (not ARM64)");
         return Ok(());
@@ -491,6 +494,48 @@ pub struct DecodedStub {
     pub selector: Option<u64>,
 }
 
+/// Decodes the ARM32 lazy-stub and optimized-stub forms emitted by dyld.
+/// PC arithmetic wraps at 32 bits; a destination's Thumb state bit is retained.
+/// O(1) time and space; mismatched registers or truncated literals return None.
+pub fn decode_arm_cache_stub(data: &[u8], pc: u64) -> Option<DecodedStub> {
+    let pc = u32::try_from(pc).ok()?;
+    let word = |i: usize| data.get(i * 4..i * 4 + 4).map(crate::util::read_u32_le);
+    let first = word(0)?;
+    let second = word(1)?;
+    let (size, target, indirect) =
+        if first == 0xe59fc004 && second == 0xe08fc00c && word(2)? == 0xe59cf000 {
+            (16, pc.wrapping_add(12).wrapping_add(word(3)?), true)
+        } else if first == 0xe59fc000 && second == 0xe08ff00c && word(3)? == 0xe7ffdefe {
+            (16, pc.wrapping_add(12).wrapping_add(word(2)?), false)
+        } else if first == 0xe59fc000 && second == 0xe12fff1c {
+            (12, word(2)?, false)
+        } else if first == 0xe51ff004 {
+            (8, second, false)
+        } else {
+            return None;
+        };
+    Some(DecodedStub {
+        size,
+        target: target as u64,
+        indirect,
+        selector: None,
+    })
+}
+
+pub(crate) fn decode_stub_for_cache(
+    cache: &crate::DyldContext,
+    data: &[u8],
+    pc: u64,
+) -> Option<DecodedStub> {
+    if cache.architecture().starts_with("arm64") {
+        decode_cache_stub(data, pc)
+    } else if cache.architecture().starts_with("arm") {
+        decode_arm_cache_stub(data, pc)
+    } else {
+        None
+    }
+}
+
 /// Decodes validated ARM64 register dataflow for legacy and island stubs.
 /// O(1) time and space; returns None for truncated or mismatched instructions.
 pub fn decode_cache_stub(data: &[u8], pc: u64) -> Option<DecodedStub> {
@@ -558,6 +603,88 @@ pub fn decode_cache_stub(data: &[u8], pc: u64) -> Option<DecodedStub> {
         });
     }
     None
+}
+
+// dyld-433.5 StubOptimizer::optimizeArmStubs replaces a 16-byte ARM
+// lazy stub with LDR ip,[pc]; ADD pc,pc,ip; displacement; trap. Restore
+// the original indirect form by matching indirect-symbol indexes, not order.
+fn fix_arm_stubs(ctx: &mut ExtractionContext) -> Result<()> {
+    use crate::macho::*;
+    use std::collections::HashMap;
+    let bad = |reason: &str| crate::Error::Parse {
+        offset: 0,
+        reason: reason.into(),
+    };
+    let Some(dysym) = ctx.macho.dysymtab().copied() else {
+        return Ok(());
+    };
+    let mut indirect = Vec::new();
+    for i in 0..dysym.nindirectsyms as usize {
+        indirect.push(ctx.macho.read_u32(dysym.indirectsymoff as usize + i * 4)?);
+    }
+    let mut slots = HashMap::new();
+    let mut stubs = Vec::new();
+    for seg in ctx.macho.segments() {
+        for section in &seg.sections {
+            let s = &section.section;
+            match s.flags & SECTION_TYPE {
+                S_LAZY_SYMBOL_POINTERS
+                | S_NON_LAZY_SYMBOL_POINTERS
+                | S_LAZY_DYLIB_SYMBOL_POINTERS => {
+                    if s.size % 4 != 0 {
+                        return Err(bad("unaligned ARM symbol pointer section"));
+                    }
+                    for i in 0..s.size as usize / 4 {
+                        let symbol = *indirect
+                            .get(s.reserved1 as usize + i)
+                            .ok_or_else(|| bad("ARM pointer indirect index outside table"))?;
+                        if symbol & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS) == 0 {
+                            slots.entry(symbol).or_insert(s.addr + (i * 4) as u64);
+                        }
+                    }
+                }
+                S_SYMBOL_STUBS => stubs.push(*s),
+                _ => {}
+            }
+        }
+    }
+    let mut fixed = 0;
+    for section in stubs {
+        if section.reserved2 == 0 || section.size % section.reserved2 as u64 != 0 {
+            return Err(bad("invalid ARM stub stride"));
+        }
+        // Other linker stub formats retain their original bytes and VAs.
+        if section.reserved2 != 16 {
+            continue;
+        }
+        for i in 0..section.size as usize / 16 {
+            let off = section.offset as usize + i * 16;
+            if ctx.macho.read_u32(off)? != 0xe59fc000
+                || ctx.macho.read_u32(off + 4)? != 0xe08ff00c
+                || ctx.macho.read_u32(off + 12)? != 0xe7ffdefe
+            {
+                continue;
+            }
+            let symbol = *indirect
+                .get(section.reserved1 as usize + i)
+                .ok_or_else(|| bad("ARM stub indirect index outside table"))?;
+            let Some(&slot) = slots.get(&symbol) else {
+                continue;
+            };
+            let address = u32::try_from(section.addr + (i * 16) as u64)
+                .map_err(|_| bad("ARM stub address overflow"))?;
+            let delta = (slot as u32).wrapping_sub(address.wrapping_add(12));
+            for (j, instruction) in [0xe59fc004, 0xe08fc00c, 0xe59cf000, delta]
+                .into_iter()
+                .enumerate()
+            {
+                ctx.macho.write_u32(off + j * 4, instruction)?;
+            }
+            fixed += 1;
+        }
+    }
+    ctx.info(&format!("Restored {fixed} optimized ARM stubs"));
+    Ok(())
 }
 
 #[cfg(test)]

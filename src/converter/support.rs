@@ -5,7 +5,6 @@ use crate::dyld::MappingFlags;
 use crate::macho::*;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashSet};
-use zerocopy::IntoBytes;
 
 /// Adds a mapped analysis segment in verified unused load-command padding.
 /// Rejects overlaps and insufficient padding instead of overwriting image code.
@@ -27,7 +26,8 @@ pub(crate) fn append_segment(
     }) {
         return Err(invalid("support segment overlaps image VM range"));
     }
-    let size = SegmentCommand64::SIZE + Section64::SIZE;
+    let segment_size = ctx.macho.segment_command_size();
+    let size = segment_size + ctx.macho.section_size();
     let boundary = |ctx: &ExtractionContext| {
         ctx.macho
             .segments()
@@ -35,9 +35,9 @@ pub(crate) fn append_segment(
             .filter(|s| s.section.offset != 0 && s.section.size != 0)
             .map(|s| s.section.offset as usize)
             .min()
-            .unwrap_or(32 + ctx.macho.header.sizeofcmds as usize)
+            .unwrap_or(ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize)
     };
-    let mut off = 32 + ctx.macho.header.sizeofcmds as usize;
+    let mut off = ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize;
     if off + size > boundary(ctx)
         || ctx
             .macho
@@ -54,7 +54,7 @@ pub(crate) fn append_segment(
             remove_load_command(ctx, cmd)?;
         }
         ctx.macho.refresh()?;
-        off = 32 + ctx.macho.header.sizeofcmds as usize;
+        off = ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize;
         if off + size > boundary(ctx)
             || ctx
                 .macho
@@ -63,7 +63,7 @@ pub(crate) fn append_segment(
                 .is_none_or(|b| b.iter().any(|v| *v != 0))
         {
             move_header(ctx, size)?;
-            off = 32 + ctx.macho.header.sizeofcmds as usize;
+            off = ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize;
         }
     }
     let fileoff = ctx.macho.data.len();
@@ -111,8 +111,8 @@ pub(crate) fn append_segment(
     } else {
         "__objc_const"
     });
-    ctx.macho.data[off..off + 72].copy_from_slice(command.as_bytes());
-    ctx.macho.data[off + 72..off + size].copy_from_slice(section.as_bytes());
+    ctx.macho.write_segment(off, &command)?;
+    ctx.macho.write_section(off + segment_size, &section)?;
     ctx.macho.write_u32(16, ctx.macho.header.ncmds + 1)?;
     ctx.macho
         .write_u32(20, ctx.macho.header.sizeofcmds + size as u32)?;
@@ -322,8 +322,10 @@ fn invalid(reason: &str) -> Error {
 // method IMP and function-start delta. A sectionless header segment also leaves
 // all existing nlist section ordinals unchanged.
 fn move_header(ctx: &mut ExtractionContext, required: usize) -> Result<()> {
-    let header_end = 32 + ctx.macho.header.sizeofcmds as usize;
-    let growth = (header_end + required + 72 + 0xffff) & !0xffff;
+    let header_end = ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize;
+    let header_size = ctx.macho.header_size();
+    let segment_size = ctx.macho.segment_command_size();
+    let growth = (header_end + required + segment_size + 0xffff) & !0xffff;
     let min_vm = ctx
         .cache
         .mappings
@@ -348,13 +350,21 @@ fn move_header(ctx: &mut ExtractionContext, required: usize) -> Result<()> {
                     .fileoff
                     .checked_add(growth as u64)
                     .ok_or_else(|| invalid("file offset overflow"))?;
-                old[off + 40..off + 48].copy_from_slice(&fileoff.to_le_bytes());
+                if ctx.macho.is_64() {
+                    old[off + 40..off + 48].copy_from_slice(&fileoff.to_le_bytes());
+                } else {
+                    let value = u32::try_from(fileoff)
+                        .map_err(|_| invalid("32-bit file offset overflow"))?;
+                    old[off + 32..off + 36].copy_from_slice(&value.to_le_bytes());
+                }
                 for section in &seg.sections {
                     if section.section.offset != 0 {
-                        offset_fields.push(section.struct_offset + 48);
+                        offset_fields
+                            .push(section.struct_offset + if ctx.macho.is_64() { 48 } else { 40 });
                     }
                     if section.section.reloff != 0 {
-                        offset_fields.push(section.struct_offset + 56);
+                        offset_fields
+                            .push(section.struct_offset + if ctx.macho.is_64() { 56 } else { 48 });
                     }
                 }
             }
@@ -403,13 +413,15 @@ fn move_header(ctx: &mut ExtractionContext, required: usize) -> Result<()> {
             .ok_or_else(|| invalid("file size overflow"))?
     ];
     data[growth..].copy_from_slice(&old);
-    data[..32].copy_from_slice(&old[..32]);
-    data[104..104 + header_end - 32].copy_from_slice(&old[32..header_end]);
+    data[..header_size].copy_from_slice(&old[..header_size]);
+    let commands_start = header_size + segment_size;
+    data[commands_start..commands_start + header_end - header_size]
+        .copy_from_slice(&old[header_size..header_end]);
     let mut name = [0; 16];
     name[..11].copy_from_slice(b"__DYLEX_HDR");
     let segment = SegmentCommand64 {
         cmd: LC_SEGMENT_64,
-        cmdsize: 72,
+        cmdsize: segment_size as u32,
         segname: name,
         vmaddr: header_vm,
         vmsize: growth as u64,
@@ -420,9 +432,13 @@ fn move_header(ctx: &mut ExtractionContext, required: usize) -> Result<()> {
         nsects: 0,
         flags: 0,
     };
-    data[32..104].copy_from_slice(segment.as_bytes());
+    // Serialize through the old context's ABI before replacing its buffer.
+    ctx.macho.write_segment(header_size, &segment)?;
+    data[header_size..header_size + segment_size]
+        .copy_from_slice(&ctx.macho.data[header_size..header_size + segment_size]);
     data[16..20].copy_from_slice(&(ctx.macho.header.ncmds + 1).to_le_bytes());
-    data[20..24].copy_from_slice(&(ctx.macho.header.sizeofcmds + 72).to_le_bytes());
+    data[20..24]
+        .copy_from_slice(&(ctx.macho.header.sizeofcmds + segment_size as u32).to_le_bytes());
     ctx.macho.data = data;
     ctx.macho.refresh()?;
     ctx.info("Moved analysis header to __DYLEX_HDR; original code addresses preserved");

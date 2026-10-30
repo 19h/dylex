@@ -7,7 +7,9 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use zerocopy::{FromBytes, IntoBytes};
+#[cfg(test)]
+use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 fn invalid(reason: &str) -> Error {
     Error::Parse {
@@ -49,7 +51,7 @@ fn indirect_section(s: &Section64) -> bool {
 }
 
 /// Resolve exactly the primary image and requested additions, preserving order
-/// and deduplicating canonical paths. Does not traverse dependencies.
+/// and deduplicating image addresses (including install-name aliases). Does not traverse dependencies.
 pub fn selected_merge_images(
     cache: &DyldContext,
     primary: &str,
@@ -58,9 +60,9 @@ pub fn selected_merge_images(
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
     for query in std::iter::once(primary).chain(additions.iter().map(String::as_str)) {
-        let path = &cache.resolve_image(query)?.path;
-        if seen.insert(path.clone()) {
-            paths.push(path.clone());
+        let image = cache.resolve_image(query)?;
+        if seen.insert(image.address) {
+            paths.push(image.path.clone());
         }
     }
     Ok(paths)
@@ -76,6 +78,17 @@ pub fn extract_image_with_selected_images<P: AsRef<Path>>(
     output: P,
     verbosity: u8,
 ) -> Result<()> {
+    let mut ctx = prepare_selected_images(cache, primary, additions, verbosity)?;
+    let writes = optimize_offsets(&mut ctx)?;
+    write_macho(&ctx, &writes, output)
+}
+
+pub(crate) fn prepare_selected_images(
+    cache: &Arc<DyldContext>,
+    primary: &str,
+    additions: &[String],
+    verbosity: u8,
+) -> Result<ExtractionContext> {
     let paths = selected_merge_images(cache, primary, additions)?;
     // Enforce the 32-bit file-offset limit before copying any image payload.
     // Section count is unbounded; see `SectionOrdinals` for nlist encoding.
@@ -122,8 +135,7 @@ pub fn extract_image_with_selected_images<P: AsRef<Path>>(
     .with_verbosity(verbosity);
     include_cache_support(&mut ctx)?;
     fix_objc(&mut ctx)?;
-    let writes = optimize_offsets(&mut ctx)?;
-    write_macho(&ctx, &writes, output)
+    Ok(ctx)
 }
 
 struct Symbol {
@@ -191,6 +203,11 @@ struct Segment {
 }
 
 fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> {
+    let abi = images
+        .first()
+        .ok_or_else(|| invalid("cannot combine an empty image list"))?;
+    let segment_size = abi.segment_command_size();
+    let section_size = abi.section_size();
     let mut segments = Vec::<Segment>::new();
     let mut symbols = Vec::<Symbol>::new();
     let mut indirect = Vec::<u32>::new();
@@ -200,7 +217,8 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
     let mut data_in_code = Vec::<(u64, [u8; 4])>::new();
     let mut ranges = Vec::<(u64, u64)>::new();
     for (index, image) in images.iter().enumerate() {
-        if image.header.cputype != images[0].header.cputype
+        if image.is_64() != abi.is_64()
+            || image.header.cputype != images[0].header.cputype
             || image.header.cpusubtype != images[0].header.cpusubtype
         {
             return Err(invalid("cannot merge different CPU types"));
@@ -214,9 +232,9 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
                 for n in bytes(
                     &image.data,
                     command.symoff as u64,
-                    command.nsyms as u64 * 16,
+                    command.nsyms as u64 * image.nlist_size() as u64,
                 )?
-                .chunks_exact(16)
+                .chunks_exact(image.nlist_size())
                 {
                     if n[5] != 0 {
                         referenced_sections.insert(n[5] as usize);
@@ -286,7 +304,7 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
                 }
             }
             command.nsects = u32size(sections.len())?;
-            command.cmdsize = u32size(SegmentCommand64::SIZE + sections.len() * Section64::SIZE)?;
+            command.cmdsize = u32size(segment_size + sections.len() * section_size)?;
             segments.push(Segment {
                 command,
                 sections,
@@ -306,10 +324,14 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
             match lc {
                 LoadCommandInfo::Symtab { command: c, .. } => {
                     let strings = bytes(&image.data, c.stroff as u64, c.strsize as u64)?;
-                    for raw in
-                        bytes(&image.data, c.symoff as u64, c.nsyms as u64 * 16)?.chunks_exact(16)
+                    for raw in bytes(
+                        &image.data,
+                        c.symoff as u64,
+                        c.nsyms as u64 * image.nlist_size() as u64,
+                    )?
+                    .chunks_exact(image.nlist_size())
                     {
-                        let (mut entry, _) = Nlist64::read_from_prefix(raw).unwrap();
+                        let mut entry = read_nlist(raw, image.is_64())?;
                         let tail = strings
                             .get(entry.n_strx as usize..)
                             .ok_or_else(|| invalid("symbol name index outside string table"))?;
@@ -502,7 +524,7 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
             strings.extend_from_slice(alias);
             strings.push(0);
         }
-        linkedit.extend_from_slice(entry.as_bytes());
+        append_nlist(&mut linkedit, &entry, abi.is_64())?;
     }
     let indirect_offset = u32size(linkedit.len())?;
     for i in &indirect {
@@ -523,16 +545,16 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
     let dic_offset = u32size(linkedit.len())?;
     // Header capacity includes all final commands; later support imports use the
     // existing safe header-growth path if this padding is exhausted.
-    let command_size = 2 * SegmentCommand64::SIZE
+    let command_size = 2 * segment_size
         + 24
         + 80
         + 16
         + commands.iter().map(Vec::len).sum::<usize>()
         + segments
             .iter()
-            .map(|s| 72 + s.sections.len() * 80)
+            .map(|s| segment_size + s.sections.len() * section_size)
             .sum::<usize>();
-    let header_size = (32 + command_size + 0xffff) & !0xffff;
+    let header_size = (abi.header_size() + command_size + 0xffff) & !0xffff;
     let header_vm = min_vm
         .checked_sub(header_size as u64)
         .ok_or_else(|| invalid("no address space for merged header"))?;
@@ -559,12 +581,12 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
                 section.offset = u32size(segment.command.fileoff as usize + delta as usize)?;
             }
         }
-        segment_commands.push(segment.command.as_bytes().to_vec());
+        segment_commands.push(abi.segment_bytes(&segment.command)?);
         for s in &segment.sections {
             segment_commands
                 .last_mut()
                 .unwrap()
-                .extend_from_slice(s.as_bytes());
+                .extend_from_slice(&abi.section_bytes(s)?);
         }
         data.extend_from_slice(&segment.data);
         u32size(data.len())?;
@@ -588,7 +610,7 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
         .ok_or_else(|| invalid("no address space for merged LINKEDIT"))?;
     let header_segment = SegmentCommand64 {
         cmd: LC_SEGMENT_64,
-        cmdsize: 72,
+        cmdsize: segment_size as u32,
         segname: name("__DYLEX_HDR"),
         vmaddr: header_vm,
         vmsize: header_size as u64,
@@ -640,9 +662,9 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
             .ok_or_else(|| invalid("data-in-code offset overflow"))?,
         datasize: linksize - dic_offset,
     };
-    let mut all = vec![header_segment.as_bytes().to_vec()];
+    let mut all = vec![abi.segment_bytes(&header_segment)?];
     all.extend(segment_commands);
-    all.push(link_segment.as_bytes().to_vec());
+    all.push(abi.segment_bytes(&link_segment)?);
     all.extend(commands);
     all.extend([
         symtab.as_bytes().to_vec(),
@@ -653,8 +675,8 @@ fn combine_images(images: &[MachOContext], min_vm: u64) -> Result<MachOContext> 
     header.ncmds = u32size(all.len())?;
     header.sizeofcmds = u32size(all.iter().map(Vec::len).sum())?;
     header.flags &= !(0x8000_0000 | 0x80); // MH_DYLIB_IN_CACHE | MH_TWOLEVEL
-    data[..32].copy_from_slice(header.as_bytes());
-    let mut cursor = 32;
+    data[..abi.header_size()].copy_from_slice(&header.as_bytes()[..abi.header_size()]);
+    let mut cursor = abi.header_size();
     for cmd in all {
         data[cursor..cursor + cmd.len()].copy_from_slice(&cmd);
         cursor += cmd.len();

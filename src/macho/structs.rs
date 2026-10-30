@@ -79,7 +79,13 @@ impl MachHeader64 {
                 }
             }
             CPU_TYPE_X86_64 => "x86_64",
-            CPU_TYPE_ARM => "arm",
+            CPU_TYPE_ARM => match self.cpusubtype & 0xff {
+                6 => "armv6",
+                9 => "armv7",
+                11 => "armv7s",
+                12 => "armv7k",
+                _ => "arm",
+            },
             CPU_TYPE_X86 => "i386",
             _ => "unknown",
         }
@@ -431,6 +437,32 @@ impl Default for DysymtabCommand {
             nlocrel: 0,
         }
     }
+}
+
+/// Reads an on-disk nlist into widened fields without changing its ABI.
+pub fn read_nlist(data: &[u8], is_64: bool) -> crate::error::Result<Nlist64> {
+    let size = if is_64 { 16 } else { 12 };
+    if data.len() < size {
+        return Err(crate::error::Error::BufferTooSmall {
+            needed: size,
+            available: data.len(),
+        });
+    }
+    let mut bytes = [0u8; 16];
+    bytes[..size].copy_from_slice(&data[..size]);
+    Ok(Nlist64::read_from_prefix(&bytes).unwrap().0)
+}
+
+/// Appends a widened symbol in the requested on-disk ABI; rejects truncation.
+pub fn append_nlist(data: &mut Vec<u8>, symbol: &Nlist64, is_64: bool) -> crate::error::Result<()> {
+    if !is_64 && symbol.n_value > u32::MAX as u64 {
+        return Err(crate::error::Error::Parse {
+            offset: data.len(),
+            reason: "32-bit symbol value overflow".into(),
+        });
+    }
+    data.extend_from_slice(&symbol.as_bytes()[..if is_64 { 16 } else { 12 }]);
+    Ok(())
 }
 
 /// 64-bit symbol table entry.

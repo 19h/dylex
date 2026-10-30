@@ -1,7 +1,6 @@
 //! Address ownership and bounded traversal of sectionless cache stubs.
 use super::*;
 use crate::{Error, Result, macho::*};
-use zerocopy::FromBytes;
 
 /// Image segment containing an address. Shared LINKEDIT is not image ownership.
 #[derive(Debug)]
@@ -99,17 +98,20 @@ impl DyldContext {
             };
             for lc in &header.load_commands {
                 if let LoadCommandInfo::Symtab { command, .. } = lc {
-                    let size = command.nsyms.checked_mul(16).ok_or(Error::Parse {
-                        offset: command.symoff as usize,
-                        reason: "symbol table size overflow".into(),
-                    })?;
+                    let size = command
+                        .nsyms
+                        .checked_mul(header.nlist_size() as u32)
+                        .ok_or(Error::Parse {
+                            offset: command.symoff as usize,
+                            reason: "symbol table size overflow".into(),
+                        })?;
                     if size == 0 {
                         continue;
                     }
                     let table = read(command.symoff, size)?;
                     let strings = read(command.stroff, command.strsize)?;
-                    for entry in table.chunks_exact(16) {
-                        let (n, _) = Nlist64::read_from_prefix(entry).unwrap();
+                    for entry in table.chunks_exact(header.nlist_size()) {
+                        let n = read_nlist(entry, header.is_64())?;
                         if n.n_type & N_STAB != 0 || !matches!(n.n_type & N_TYPE, N_SECT | N_ABS) {
                             continue;
                         }
@@ -165,19 +167,21 @@ impl DyldContext {
         Ok(None)
     }
 
-    /// Decode an ARM64 cache-owned trampoline. Ordinary image code is not
+    /// Decode a recognized ARM32 or ARM64 cache trampoline. Ordinary image code is not
     /// followed. The caller bounds traversal and detects cycles.
     pub fn cache_stub_target(&self, address: u64) -> Result<Option<(u64, Option<String>)>> {
-        if !self.architecture().starts_with("arm64") {
+        if !self.architecture().starts_with("arm") {
             return Ok(None);
         }
         let Some(mapping) = self.mapping_for_addr(address).filter(|m| m.is_executable()) else {
             return Ok(None);
         };
         let size = (mapping.size - (address - mapping.address)).min(16) as usize;
-        let Some(stub) =
-            crate::converter::decode_cache_stub(self.data_at_addr(address, size)?, address)
-        else {
+        let Some(stub) = crate::converter::decode_stub_for_cache(
+            self,
+            self.data_at_addr(address, size)?,
+            address,
+        ) else {
             return Ok(None);
         };
         if stub.size == 4 && mapping.flags & MappingFlags::TEXT_STUBS.bits() == 0 {

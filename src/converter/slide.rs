@@ -1,12 +1,12 @@
 //! Decode slide chains from the source cache, including portions belonging to
 //! neighboring images on the same page. Only file-backed output slots are written.
 use super::ExtractionContext;
-use crate::dyld::{MappingEntry, SlidePointer3, SlidePointer5};
+use crate::dyld::{MappingEntry, decode_slide_pointer};
 use crate::util::{read_u32_le, read_u64_le};
 use crate::{Error, Result};
 use std::collections::BTreeSet;
 
-/// Removes v2/v3/v5 slide encoding from image pointers (including x86_64 v2).
+/// Processes v1 bitmaps and removes v2/v3/v4/v5 slide encoding from image pointers.
 /// Each chain is bounded by its source page; malformed tables fail explicitly.
 pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
     let cache = std::sync::Arc::clone(&ctx.cache);
@@ -23,12 +23,17 @@ pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
             return Err(invalid(mapping, "truncated slide header"));
         }
         let version = read_u32_le(slide);
+        if version == 1 {
+            process_bitmap(ctx, mapping, slide)?;
+            continue;
+        }
+        let width = ctx.macho.pointer_size() as u64;
         let page_size = read_u32_le(&slide[4..]) as u64;
         if page_size != 4096 && page_size != 16384 {
             return Err(invalid(mapping, "unsupported slide page size"));
         }
-        let (count, starts, extras, extras_count, mask, base) = match version {
-            2 if slide.len() >= 40 => (
+        let (count, starts, extras, extras_count, mask, _base) = match version {
+            2 | 4 if slide.len() >= 40 => (
                 read_u32_le(&slide[12..]) as usize,
                 read_u32_le(&slide[8..]) as usize,
                 read_u32_le(&slide[16..]) as usize,
@@ -59,7 +64,7 @@ pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
             table(slide, extras, extras_count)
                 .ok_or_else(|| invalid(mapping, "page extras outside slide table"))?
         };
-        if version == 2 && (mask == 0 || mask.trailing_zeros() < 2) {
+        if matches!(version, 2 | 4) && (mask == 0 || mask.trailing_zeros() < 2) {
             return Err(invalid(mapping, "invalid v2 delta mask"));
         }
         // Examine only pages intersecting file-backed image segments. A chain
@@ -84,18 +89,18 @@ pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
         for page in pages {
             let value = u16::from_le_bytes(starts_data[page * 2..page * 2 + 2].try_into().unwrap());
             let mut heads = Vec::new();
-            if version == 2 {
-                if value == 0x4000 {
+            if matches!(version, 2 | 4) {
+                if value == if version == 4 { 0xffff } else { 0x4000 } {
                     continue;
                 }
                 if value & 0x8000 != 0 {
-                    let mut index = (value & 0x3fff) as usize;
+                    let mut index = (value & if version == 4 { 0x7fff } else { 0x3fff }) as usize;
                     loop {
                         let b = extras_data
                             .get(index * 2..index * 2 + 2)
                             .ok_or_else(|| invalid(mapping, "unterminated v2 page extras"))?;
                         let entry = u16::from_le_bytes(b.try_into().unwrap());
-                        heads.push((entry & 0x3fff) as u64 * 4);
+                        heads.push((entry & if version == 4 { 0x7fff } else { 0x3fff }) as u64 * 4);
                         if entry & 0x8000 != 0 {
                             break;
                         }
@@ -115,47 +120,22 @@ pub fn process_slide_info(ctx: &mut ExtractionContext) -> Result<()> {
             for start in heads {
                 let mut addr = page_start + start;
                 loop {
-                    if addr.checked_add(8).is_none_or(|end| end > page_end) {
-                        return Err(invalid(mapping, "slide chain leaves page"));
+                    if addr.checked_add(width).is_none_or(|end| end > page_end)
+                        || (addr - page_start) % 4 != 0
+                    {
+                        return Err(invalid(mapping, "slide chain leaves page or is unaligned"));
                     }
-                    let raw = read_u64_le(cache.data_at_addr(addr, 8)?);
-                    let (value, delta) = match version {
-                        2 => {
-                            let raw_value = raw & !mask;
-                            let value = if raw_value == 0 {
-                                0
-                            } else {
-                                raw_value
-                                    .checked_add(base)
-                                    .ok_or_else(|| invalid(mapping, "v2 pointer overflow"))?
-                            };
-                            (value, ((raw & mask) >> mask.trailing_zeros()) * 4)
-                        }
-                        3 => {
-                            let p = SlidePointer3(raw);
-                            let value = if p.is_auth() {
-                                base.checked_add(p.auth_offset() as u64)
-                                    .ok_or_else(|| invalid(mapping, "v3 pointer overflow"))?
-                            } else {
-                                p.plain_value()
-                            };
-                            (value, p.offset_to_next() * 8)
-                        }
-                        5 => {
-                            let p = SlidePointer5(raw);
-                            let mut value = base
-                                .checked_add(p.runtime_offset())
-                                .ok_or_else(|| invalid(mapping, "v5 pointer overflow"))?;
-                            if !p.is_auth() {
-                                value |= (p.high8() as u64) << 56;
-                            }
-                            (value, p.next() * 8)
-                        }
-                        _ => unreachable!(),
+                    let raw = if width == 4 {
+                        read_u32_le(cache.data_at_addr(addr, 4)?) as u64
+                    } else {
+                        read_u64_le(cache.data_at_addr(addr, 8)?)
                     };
+                    let (value, delta) = decode_slide_pointer(slide, raw, width as usize)?;
                     if let Some(offset) = ctx.macho.addr_to_offset(addr) {
-                        if ctx.macho.addr_to_offset(addr + 7) == Some(offset + 7) {
-                            ctx.macho.write_u64(offset, value)?;
+                        if ctx.macho.addr_to_offset(addr + width - 1)
+                            == Some(offset + width as usize - 1)
+                        {
+                            ctx.macho.write_pointer(offset, value)?;
                         }
                     }
                     if delta == 0 {
@@ -179,4 +159,45 @@ fn invalid(mapping: &MappingEntry, reason: &str) -> Error {
         offset: mapping.slide_info_offset,
         reason: reason.into(),
     }
+}
+
+// v1 stores one 128-byte bitmap per 4096-byte data page. Each bit denotes
+// a 4-byte slot. There is no chain encoding to strip at slide zero.
+fn process_bitmap(ctx: &mut ExtractionContext, mapping: &MappingEntry, slide: &[u8]) -> Result<()> {
+    if slide.len() < 24 || ctx.macho.pointer_size() != 4 {
+        return Err(invalid(mapping, "invalid v1 slide header or pointer width"));
+    }
+    let toc_offset = read_u32_le(&slide[4..]) as usize;
+    let toc_count = read_u32_le(&slide[8..]) as usize;
+    let entries_offset = read_u32_le(&slide[12..]) as usize;
+    let entries_count = read_u32_le(&slide[16..]) as usize;
+    let entry_size = read_u32_le(&slide[20..]) as usize;
+    if entry_size != 128
+        || table(slide, toc_offset, toc_count).is_none()
+        || entries_count
+            .checked_mul(entry_size)
+            .and_then(|n| entries_offset.checked_add(n))
+            .is_none_or(|end| end > slide.len())
+    {
+        return Err(invalid(mapping, "invalid v1 slide bitmap extent"));
+    }
+    for segment in ctx.macho.segments() {
+        let start = segment.command.vmaddr.max(mapping.address);
+        let end =
+            (segment.command.vmaddr + segment.command.filesize).min(mapping.address + mapping.size);
+        if start >= end {
+            continue;
+        }
+        for page in (start - mapping.address) / 4096..=(end - 1 - mapping.address) / 4096 {
+            if page >= toc_count as u64 {
+                return Err(invalid(mapping, "v1 page missing from table"));
+            }
+            let pos = toc_offset + page as usize * 2;
+            let entry = u16::from_le_bytes(slide[pos..pos + 2].try_into().unwrap()) as usize;
+            if entry >= entries_count {
+                return Err(invalid(mapping, "v1 bitmap index out of bounds"));
+            }
+        }
+    }
+    Ok(())
 }

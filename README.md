@@ -13,7 +13,7 @@ dylex extracts Mach-O files for static analysis from Apple's dyld shared cache, 
 
 - **Fast Extraction** - Memory-mapped I/O and parallel processing for maximum speed
 - **Automatic Cache Discovery** - Finds system caches automatically on macOS
-- **Architecture Selection** - Support for arm64, arm64e, and x86_64 caches
+- **Architecture Selection** - Support for 32-bit ARM (armv6, armv7, armv7s, armv7k), arm64, arm64e, and x86_64 caches
 - **Symbol Table Reconstruction** - Rebuilds standalone LINKEDIT with proper symbol tables
 - **Pointer Rebasing** - Handles slide info v3/v5 for correct pointer values
 - **ObjC Metadata Restoration** - Reconstructs coalesced strings and absolute method entries before clearing encoding flags
@@ -420,6 +420,61 @@ dylex info /System/Volumes/Preboot/Cryptexes/Rosetta/System/x86Support/System/Li
 
 These Rosetta paths were observed on macOS 27 build `26A5425a`. Discovery excludes
 staged `Incoming` updates and DriverKit subtrees unless selected explicitly.
+
+## 32-bit ARM caches
+
+Legacy little-endian ARM caches use `MH_MAGIC` (`0xfeedface`), a 28-byte
+header, `LC_SEGMENT`, 68-byte sections, 12-byte symbol entries, and 4-byte
+pointers. Dylex preserves this ABI throughout extraction, including Thumb
+symbol descriptors and pointer state bits. It supports slide formats v1
+(bitmap), v2 (32-bit chains), and v4 (chains with small integer entries),
+cache-local symbols, indirect symbol tables, ARM lazy stubs, and Objective-C
+classes, categories, protocols, methods, ivars, properties, and selectors.
+Pointer fields absent from a slide chain retain their original absolute values.
+
+Pass the cache path positionally; no architecture override is necessary:
+
+```bash
+cargo build --release
+cache=/path/to/dyld_shared_cache_armv7s
+./target/release/dylex extract "$cache" -f dylib -o ./armv7s-dylibs
+./target/release/dylex extract "$cache" -f '' -o ./armv7s-all
+./target/release/dylex extract "$cache" -i /usr/lib/libobjc.A.dylib \
+    --merge-image /usr/lib/libSystem.B.dylib -o ./objc-system.dylib
+```
+
+Selected-image and dependency merges retain original ARM/Thumb code addresses.
+Install-name aliases sharing an image address are merged once. Runtime inference
+uses declared 4-byte pointer sections, recognized ARM stubs, and direct ARM/Thumb
+branches where mapped or cache-local symbols establish instruction mode.
+Instruction regions with unknown mode and register-only targets remain unknown. As with other
+architectures, outputs are for static analysis; loading them on an iOS device
+is not a validation criterion.
+
+`MachOContext` exposes widened segment, section, symbol, and header fields in
+its existing Rust types. Use `header_size()`, `pointer_size()`, `nlist_size()`,
+`write_segment()`, `write_section()`, and `sync_header()` rather than serializing
+those widened structures directly into a 32-bit image.
+
+Validation includes synthetic armv6/armv7/armv7s/armv7k fixtures, slide v1/v2/v4,
+Objective-C graphs, cache-local symbols, aliases, dependencies, runtime inference,
+and both merge paths. A separate standard-library Python verifier checks an
+archived ARM32 v2 cache and its extraction directory without using Dylex's parser:
+
+```bash
+cargo test --all-targets
+python3 scripts/verify_arm32_cache.py "$cache" ./armv7s-all --report verification.json
+```
+
+The verifier checks every image path, code byte preservation, complete and
+partial slide words, symbol and indirect-symbol bounds, dyld-info extents, and
+Objective-C class/method/selector references. It currently targets monolithic
+ARM32 v2 caches; synthetic Rust tests cover v1 and v4.
+
+Format references: Apple's [Mach-O loader definitions](https://github.com/apple-oss-distributions/cctools/blob/main/include/mach-o/loader.h),
+[slide format definitions](https://github.com/apple-oss-distributions/dyld/blob/main/include/mach-o/dyld_cache_format.h),
+[ARM stub/Thumb branch optimizer](https://github.com/apple-oss-distributions/dyld/blob/dyld-433.5/interlinked-dylibs/OptimizerBranches.cpp),
+and [Objective-C runtime layouts](https://github.com/apple-oss-distributions/objc4/blob/objc4-706/runtime/objc-runtime-new.h).
 
 ## Architecture Selection
 

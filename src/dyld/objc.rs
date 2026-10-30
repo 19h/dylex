@@ -3,7 +3,7 @@
 
 use super::{DyldCacheHeader, DyldContext, SlidePointer3, SlidePointer5};
 use crate::error::{Error, Result};
-use crate::macho::{MachHeader64, MachOContext};
+use crate::macho::{MH_MAGIC, MachOContext};
 use crate::util::{read_u32_le, read_u64_le};
 use std::mem::offset_of;
 
@@ -23,10 +23,25 @@ pub struct ObjcOptimization {
 }
 
 impl DyldContext {
+    /// Pointer width of images in this cache, in bytes (arm64_32 uses 4).
+    pub fn pointer_size(&self) -> usize {
+        let arch = self.architecture();
+        if arch == "arm64_32" || (!arch.starts_with("arm64") && !arch.starts_with("x86_64")) {
+            4
+        } else {
+            8
+        }
+    }
+
     /// Reads an image's header and commands without copying its segments.
     pub fn image_header(&self, address: u64) -> Result<MachOContext> {
-        let header = self.data_at_addr(address, MachHeader64::SIZE)?;
-        let size = MachHeader64::SIZE + read_u32_le(&header[20..]) as usize;
+        let header = self.data_at_addr(address, 28)?;
+        let header_size = if read_u32_le(header) == MH_MAGIC {
+            28
+        } else {
+            32
+        };
+        let size = header_size + read_u32_le(&header[20..]) as usize;
         MachOContext::new(self.data_at_addr(address, size)?, 0)
     }
 
@@ -139,7 +154,11 @@ impl DyldContext {
     /// Decodes a known pointer slot using the containing mapping's slide format.
     /// This must only be used for pointer fields, not arbitrary data words.
     pub fn pointer_at(&self, address: u64) -> Result<u64> {
-        let raw = read_u64_le(self.data_at_addr(address, 8)?);
+        let raw = if self.pointer_size() == 4 {
+            read_u32_le(self.data_at_addr(address, 4)?) as u64
+        } else {
+            read_u64_le(self.data_at_addr(address, 8)?)
+        };
         if raw == 0 {
             return Ok(0);
         }
@@ -165,37 +184,118 @@ impl DyldContext {
                 reason: "truncated slide info".into(),
             });
         }
-        match read_u32_le(slide) {
-            2 if slide.len() >= 40 => {
-                let value = raw & !read_u64_le(&slide[24..]);
-                if value == 0 {
-                    Ok(0)
-                } else {
-                    checked_address(value, read_u64_le(&slide[32..]))
-                }
-            }
-            3 if slide.len() >= 24 => {
-                let p = SlidePointer3(raw);
-                if p.is_auth() {
-                    checked_address(read_u64_le(&slide[16..]), p.auth_offset() as u64)
-                } else {
-                    Ok(p.plain_value())
-                }
-            }
-            5 if slide.len() >= 24 => {
-                let p = SlidePointer5(raw);
-                let value = checked_address(read_u64_le(&slide[16..]), p.runtime_offset())?;
-                Ok(if p.is_auth() {
-                    value
-                } else {
-                    value | ((p.high8() as u64) << 56)
-                })
-            }
-            version => Err(Error::Parse {
-                offset: off,
-                reason: format!("unsupported pointer slide version {version}"),
-            }),
+        if self.pointer_size() == 4 && matches!(read_u32_le(slide), 2 | 4) {
+            return self
+                .slid_pointer32(address, m, slide, raw as u32)
+                .map(u64::from);
         }
+        decode_slide_pointer(slide, raw, self.pointer_size()).map(|(value, _)| value)
+    }
+    fn slid_pointer32(
+        &self,
+        address: u64,
+        mapping: &super::MappingEntry,
+        slide: &[u8],
+        raw: u32,
+    ) -> Result<u32> {
+        let bad = |reason: &str| Error::InvalidSlideInfo {
+            offset: mapping.slide_info_offset,
+            reason: reason.into(),
+        };
+        if slide.len() < 40 {
+            return Err(bad("truncated ARM slide table"));
+        }
+        let page_size = read_u32_le(&slide[4..]) as u64;
+        if !matches!(page_size, 4096 | 16384) {
+            return Err(bad("invalid ARM slide page size"));
+        }
+        let page = (address - mapping.address) / page_size;
+        let page_start = mapping.address + page * page_size;
+        let existing = self
+            .slide32_pages
+            .lock()
+            .map_err(|_| bad("slide page cache poisoned"))?
+            .get(&page_start)
+            .cloned();
+        let words = if let Some(words) = existing {
+            words
+        } else {
+            let version = read_u32_le(slide);
+            let count = read_u32_le(&slide[12..]) as u64;
+            if page >= count {
+                return Err(bad("ARM page missing from slide table"));
+            }
+            let table = |offset: usize, count: usize| {
+                slide.get(offset..offset.checked_add(count.checked_mul(2)?)?)
+            };
+            let starts = table(read_u32_le(&slide[8..]) as usize, count as usize)
+                .ok_or_else(|| bad("ARM page starts out of bounds"))?;
+            let entry = u16::from_le_bytes(
+                starts[page as usize * 2..page as usize * 2 + 2]
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut heads = Vec::new();
+            if entry != if version == 4 { 0xffff } else { 0x4000 } {
+                if entry & 0x8000 != 0 {
+                    let mask = if version == 4 { 0x7fff } else { 0x3fff };
+                    let extras = table(
+                        read_u32_le(&slide[16..]) as usize,
+                        read_u32_le(&slide[20..]) as usize,
+                    )
+                    .ok_or_else(|| bad("ARM page extras out of bounds"))?;
+                    let mut index = (entry & mask) as usize;
+                    loop {
+                        let bytes = extras
+                            .get(index * 2..index * 2 + 2)
+                            .ok_or_else(|| bad("unterminated ARM page extras"))?;
+                        let value = u16::from_le_bytes(bytes.try_into().unwrap());
+                        heads.push((value & mask) as u64 * 4);
+                        if value & 0x8000 != 0 {
+                            break;
+                        }
+                        index += 1;
+                    }
+                } else {
+                    heads.push(entry as u64 * 4);
+                }
+            }
+            let mut words = Vec::new();
+            for mut offset in heads {
+                loop {
+                    if offset % 4 != 0
+                        || offset.checked_add(4).is_none_or(|end| {
+                            end > page_size || page_start + end > mapping.address + mapping.size
+                        })
+                    {
+                        return Err(bad("ARM chain leaves page"));
+                    }
+                    let raw = read_u32_le(self.data_at_addr(page_start + offset, 4)?);
+                    let (value, delta) = decode_slide_pointer(slide, raw as u64, 4)?;
+                    words.push((offset as u16, value as u32));
+                    if delta == 0 {
+                        break;
+                    }
+                    offset = offset
+                        .checked_add(delta)
+                        .ok_or_else(|| bad("ARM chain offset overflow"))?;
+                }
+            }
+            words.sort_unstable_by_key(|(offset, _)| *offset);
+            words.dedup_by_key(|(offset, _)| *offset);
+            let words = std::sync::Arc::new(words);
+            self.slide32_pages
+                .lock()
+                .map_err(|_| bad("slide page cache poisoned"))?
+                .entry(page_start)
+                .or_insert_with(|| words.clone())
+                .clone()
+        };
+        let offset = (address - page_start) as u16;
+        Ok(words
+            .binary_search_by_key(&offset, |(offset, _)| *offset)
+            .map(|index| words[index].1)
+            .unwrap_or(raw))
     }
 }
 
@@ -204,4 +304,76 @@ fn checked_address(base: u64, offset: u64) -> Result<u64> {
         offset: 0,
         reason: "cache address overflow".into(),
     })
+}
+
+/// Decodes one slide-chain word and its byte distance to the next word.
+/// v1 words are already unslid; bitmap membership is handled by the walker.
+pub(crate) fn decode_slide_pointer(slide: &[u8], raw: u64, width: usize) -> Result<(u64, u64)> {
+    let bad = || Error::Parse {
+        offset: 0,
+        reason: "invalid slide pointer encoding".into(),
+    };
+    if slide.len() < 4 {
+        return Err(bad());
+    }
+    match read_u32_le(slide) {
+        1 => Ok((raw, 0)),
+        version @ (2 | 4) if slide.len() >= 40 => {
+            if version == 4 && width != 4 {
+                return Err(bad());
+            }
+            let mask = read_u64_le(&slide[24..]);
+            if mask == 0 || mask.trailing_zeros() < 2 || (width == 4 && mask > u32::MAX as u64) {
+                return Err(bad());
+            }
+            let bits = mask >> mask.trailing_zeros();
+            if bits & bits.wrapping_add(1) != 0 {
+                return Err(bad());
+            }
+            let base = read_u64_le(&slide[32..]);
+            let value = raw & !mask;
+            let value = if version == 4 {
+                if value & 0xffff8000 == 0 {
+                    value
+                } else if value & 0x3fff8000 == 0x3fff8000 {
+                    value | 0xc0000000
+                } else {
+                    checked_address(value, base)?
+                }
+            } else if value == 0 {
+                0
+            } else {
+                checked_address(value, base)?
+            };
+            if width == 4 && value > u32::MAX as u64 {
+                return Err(bad());
+            }
+            Ok((value, ((raw & mask) >> mask.trailing_zeros()) * 4))
+        }
+        3 if slide.len() >= 24 && width == 8 => {
+            let p = SlidePointer3(raw);
+            let value = if p.is_auth() {
+                checked_address(read_u64_le(&slide[16..]), p.auth_offset() as u64)?
+            } else {
+                p.plain_value()
+            };
+            Ok((value, p.offset_to_next() * 8))
+        }
+        5 if slide.len() >= 24 && width == 8 => {
+            let p = SlidePointer5(raw);
+            let value = checked_address(read_u64_le(&slide[16..]), p.runtime_offset())?;
+            Ok((
+                if p.is_auth() {
+                    value
+                } else {
+                    value | ((p.high8() as u64) << 56)
+                },
+                p.next() * 8,
+            ))
+        }
+        version => Err(Error::Parse {
+            offset: 0,
+            reason: format!("unsupported pointer slide version {version}"),
+        }),
+    }
 }

@@ -107,8 +107,8 @@ pub fn clear_dylib_in_cache_flag(ctx: &mut ExtractionContext) -> Result<()> {
 /// ```
 pub fn zero_chained_fixups(ctx: &mut ExtractionContext) -> Result<()> {
     // Find LC_DYLD_CHAINED_FIXUPS load command
-    let mut offset = 32usize; // Start after mach_header_64
-    let end_offset = 32 + ctx.macho.header.sizeofcmds as usize;
+    let mut offset = ctx.macho.header_size(); // Start after mach_header_64
+    let end_offset = ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize;
 
     while offset < end_offset {
         if offset + 8 > ctx.macho.data.len() {
@@ -142,8 +142,8 @@ pub fn zero_chained_fixups(ctx: &mut ExtractionContext) -> Result<()> {
 /// is not needed and zeroing it makes the binary more compatible.
 pub fn zero_exports_trie(ctx: &mut ExtractionContext) -> Result<()> {
     // Find LC_DYLD_EXPORTS_TRIE load command
-    let mut offset = 32usize; // Start after mach_header_64
-    let end_offset = 32 + ctx.macho.header.sizeofcmds as usize;
+    let mut offset = ctx.macho.header_size(); // Start after mach_header_64
+    let end_offset = ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize;
 
     while offset < end_offset {
         if offset + 8 > ctx.macho.data.len() {
@@ -173,9 +173,9 @@ pub fn zero_exports_trie(ctx: &mut ExtractionContext) -> Result<()> {
 /// This function removes commands matching the given type.
 pub fn remove_load_command(ctx: &mut ExtractionContext, cmd_type: u32) -> Result<usize> {
     let mut removed = 0;
-    let mut read_offset = 32usize;
-    let mut write_offset = 32usize;
-    let end_offset = 32 + ctx.macho.header.sizeofcmds as usize;
+    let mut read_offset = ctx.macho.header_size();
+    let mut write_offset = ctx.macho.header_size();
+    let end_offset = ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize;
 
     // Copy load commands, skipping those we want to remove
     while read_offset < end_offset {
@@ -206,7 +206,7 @@ pub fn remove_load_command(ctx: &mut ExtractionContext, cmd_type: u32) -> Result
     if removed > 0 {
         // Update header
         ctx.macho.header.ncmds -= removed as u32;
-        ctx.macho.header.sizeofcmds = (write_offset - 32) as u32;
+        ctx.macho.header.sizeofcmds = (write_offset - ctx.macho.header_size()) as u32;
 
         // Write updated header
         ctx.macho.write_u32(16, ctx.macho.header.ncmds)?; // ncmds offset

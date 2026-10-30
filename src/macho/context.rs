@@ -15,7 +15,8 @@ use crate::error::{Error, Result};
 /// Parsed segment information.
 #[derive(Debug, Clone)]
 pub struct SegmentInfo {
-    /// The segment command
+    /// Segment fields widened to 64-bit integers for either on-disk ABI.
+    /// Serialize with MachOContext::write_segment to preserve the input ABI.
     pub command: SegmentCommand64,
     /// Offset of the segment command in the file
     pub command_offset: usize,
@@ -43,7 +44,8 @@ impl SegmentInfo {
 /// Parsed section information.
 #[derive(Debug, Clone)]
 pub struct SectionInfo {
-    /// The section structure
+    /// Section fields widened to 64-bit integers for either on-disk ABI.
+    /// Serialize with MachOContext::write_section to preserve the input ABI.
     pub section: Section64,
     /// Offset of the section structure in the file
     pub struct_offset: usize,
@@ -166,7 +168,8 @@ struct SegmentRange {
 /// including segments, sections, load commands, and symbols.
 #[derive(Debug)]
 pub struct MachOContext {
-    /// The Mach-O header
+    /// Widened header fields. For MH_MAGIC, `reserved` is synthetic zero;
+    /// use `header_size()` and `sync_header()` for on-disk serialization.
     pub header: MachHeader64,
     /// Offset of this Mach-O within the containing file/cache
     pub base_offset: usize,
@@ -181,26 +184,153 @@ pub struct MachOContext {
 }
 
 impl MachOContext {
+    // Public parsed structures use widened integers, while raw bytes retain the
+    // original ABI. Always serialize through these helpers for width-dependent data.
+    fn read_header(data: &[u8]) -> Result<MachHeader64> {
+        let magic = data
+            .get(..4)
+            .map(crate::util::read_u32_le)
+            .ok_or(Error::BufferTooSmall {
+                needed: 4,
+                available: data.len(),
+            })?;
+        let size = match magic {
+            MH_MAGIC => 28,
+            MH_MAGIC_64 => 32,
+            _ => return Err(Error::InvalidMachoMagic(magic)),
+        };
+        if data.len() < size {
+            return Err(Error::BufferTooSmall {
+                needed: size,
+                available: data.len(),
+            });
+        }
+        let mut bytes = [0u8; 32];
+        bytes[..size].copy_from_slice(&data[..size]);
+        Ok(MachHeader64::read_from_prefix(&bytes).unwrap().0)
+    }
+
+    /// Whether the on-disk image uses the 64-bit Mach-O ABI.
+    pub fn is_64(&self) -> bool {
+        self.header.magic == MH_MAGIC_64
+    }
+    /// On-disk header size in bytes.
+    pub fn header_size(&self) -> usize {
+        if self.is_64() { 32 } else { 28 }
+    }
+    /// On-disk pointer width in bytes.
+    pub fn pointer_size(&self) -> usize {
+        if self.is_64() { 8 } else { 4 }
+    }
+    /// On-disk segment command size in bytes, excluding sections.
+    pub fn segment_command_size(&self) -> usize {
+        if self.is_64() { 72 } else { 56 }
+    }
+    /// On-disk section record size in bytes.
+    pub fn section_size(&self) -> usize {
+        if self.is_64() { 80 } else { 68 }
+    }
+    /// On-disk symbol record size in bytes.
+    pub fn nlist_size(&self) -> usize {
+        if self.is_64() { 16 } else { 12 }
+    }
+    /// Reads a pointer without consuming an adjacent 32-bit slot.
+    pub fn read_pointer(&self, offset: usize) -> Result<u64> {
+        if self.is_64() {
+            self.read_u64(offset)
+        } else {
+            Ok(self.read_u32(offset)? as u64)
+        }
+    }
+    /// Writes an ABI-sized pointer, rejecting truncation.
+    pub fn write_pointer(&mut self, offset: usize, value: u64) -> Result<()> {
+        if self.is_64() {
+            self.write_u64(offset, value)
+        } else {
+            let value = u32::try_from(value).map_err(|_| Error::Parse {
+                offset,
+                reason: "32-bit pointer overflow".into(),
+            })?;
+            self.write_u32(offset, value)
+        }
+    }
+    /// Serializes a widened segment using this image's on-disk ABI.
+    pub fn write_segment(&mut self, offset: usize, segment: &SegmentCommand64) -> Result<()> {
+        self.write_at(offset, &self.segment_bytes(segment)?)
+    }
+    /// Encodes a widened segment without mutating the image.
+    pub fn segment_bytes(&self, segment: &SegmentCommand64) -> Result<Vec<u8>> {
+        let offset = 0;
+        if self.is_64() {
+            return Ok(segment.as_bytes().to_vec());
+        }
+        let mut bytes = Vec::with_capacity(56);
+        bytes.extend_from_slice(&LC_SEGMENT.to_le_bytes());
+        bytes.extend_from_slice(&segment.cmdsize.to_le_bytes());
+        bytes.extend_from_slice(&segment.segname);
+        for value in [
+            segment.vmaddr,
+            segment.vmsize,
+            segment.fileoff,
+            segment.filesize,
+        ] {
+            let value = u32::try_from(value).map_err(|_| Error::Parse {
+                offset,
+                reason: "32-bit segment field overflow".into(),
+            })?;
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [
+            segment.maxprot,
+            segment.initprot,
+            segment.nsects,
+            segment.flags,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+    /// Serializes a widened section using this image's on-disk ABI.
+    pub fn write_section(&mut self, offset: usize, section: &Section64) -> Result<()> {
+        self.write_at(offset, &self.section_bytes(section)?)
+    }
+    /// Encodes a widened section without mutating the image.
+    pub fn section_bytes(&self, section: &Section64) -> Result<Vec<u8>> {
+        let offset = 0;
+        if self.is_64() {
+            return Ok(section.as_bytes().to_vec());
+        }
+        let mut bytes = Vec::with_capacity(68);
+        bytes.extend_from_slice(&section.sectname);
+        bytes.extend_from_slice(&section.segname);
+        for value in [section.addr, section.size] {
+            let value = u32::try_from(value).map_err(|_| Error::Parse {
+                offset,
+                reason: "32-bit section field overflow".into(),
+            })?;
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [
+            section.offset,
+            section.align,
+            section.reloff,
+            section.nreloc,
+            section.flags,
+            section.reserved1,
+            section.reserved2,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
     /// Creates a new MachO context from raw data.
     ///
     /// # Arguments
     /// * `data` - The raw Mach-O data (will be copied)
     /// * `base_offset` - Offset of this Mach-O within a larger file (for address conversion)
     pub fn new(data: &[u8], base_offset: usize) -> Result<Self> {
-        if data.len() < MachHeader64::SIZE {
-            return Err(Error::BufferTooSmall {
-                needed: MachHeader64::SIZE,
-                available: data.len(),
-            });
-        }
-
-        let header = MachHeader64::read_from_prefix(data)
-            .map_err(|_| Error::InvalidMachoMagic(0))?
-            .0;
-
-        if !header.is_valid() {
-            return Err(Error::InvalidMachoMagic(header.magic));
-        }
+        let header = Self::read_header(data)?;
 
         let mut ctx = Self {
             header: header.clone(),
@@ -238,9 +368,7 @@ impl MachOContext {
 
     /// Rebuilds parsed commands and address indexes after changing raw commands.
     pub fn refresh(&mut self) -> Result<()> {
-        self.header = MachHeader64::read_from_prefix(&self.data)
-            .map_err(|_| Error::InvalidMachoMagic(0))?
-            .0;
+        self.header = Self::read_header(&self.data)?;
         self.load_commands.clear();
         self.segment_indices.clear();
         self.parse_load_commands()?;
@@ -261,8 +389,8 @@ impl MachOContext {
 
     /// Parses all load commands.
     fn parse_load_commands(&mut self) -> Result<()> {
-        let mut offset = MachHeader64::SIZE;
-        let end_offset = MachHeader64::SIZE + self.header.sizeofcmds as usize;
+        let mut offset = self.header_size();
+        let end_offset = self.header_size() + self.header.sizeofcmds as usize;
 
         for _ in 0..self.header.ncmds {
             if offset + LoadCommand::SIZE > end_offset
@@ -304,35 +432,74 @@ impl MachOContext {
     /// Parses a single load command.
     fn parse_load_command(&self, cmd: u32, data: &[u8], offset: usize) -> Result<LoadCommandInfo> {
         match cmd {
-            LC_SEGMENT_64 => {
-                let seg = SegmentCommand64::read_from_prefix(data)
-                    .map_err(|_| Error::Parse {
+            LC_SEGMENT | LC_SEGMENT_64 => {
+                let is_64 = cmd == LC_SEGMENT_64;
+                if is_64 != self.is_64() {
+                    return Err(Error::Parse {
                         offset,
-                        reason: "failed to parse segment command".into(),
-                    })?
-                    .0;
-
-                let mut sections = Vec::with_capacity(seg.nsects as usize);
-                let mut sect_offset = offset + SegmentCommand64::SIZE;
-
-                for _ in 0..seg.nsects {
-                    let sect = Section64::read_from_prefix(&self.data[sect_offset..])
-                        .map_err(|_| Error::Parse {
-                            offset: sect_offset,
-                            reason: "failed to parse section".into(),
-                        })?
-                        .0;
-
-                    sections.push(SectionInfo {
-                        section: sect.clone(),
-                        struct_offset: sect_offset,
+                        reason: "segment command width differs from Mach-O header".into(),
                     });
-
-                    sect_offset += Section64::SIZE;
                 }
-
+                let segment_size = self.segment_command_size();
+                let section_size = self.section_size();
+                if data.len() < segment_size {
+                    return Err(Error::LoadCommandOverflow { offset });
+                }
+                let seg = if is_64 {
+                    SegmentCommand64::read_from_prefix(data).unwrap().0
+                } else {
+                    let u = |i| crate::util::read_u32_le(&data[i..]);
+                    SegmentCommand64 {
+                        cmd,
+                        cmdsize: u(4),
+                        segname: data[8..24].try_into().unwrap(),
+                        vmaddr: u(24) as u64,
+                        vmsize: u(28) as u64,
+                        fileoff: u(32) as u64,
+                        filesize: u(36) as u64,
+                        maxprot: u(40),
+                        initprot: u(44),
+                        nsects: u(48),
+                        flags: u(52),
+                    }
+                };
+                if (seg.nsects as usize)
+                    .checked_mul(section_size)
+                    .and_then(|n| segment_size.checked_add(n))
+                    .is_none_or(|n| n > data.len())
+                {
+                    return Err(Error::LoadCommandOverflow { offset });
+                }
+                let mut sections = Vec::with_capacity(seg.nsects as usize);
+                for i in 0..seg.nsects as usize {
+                    let local = segment_size + i * section_size;
+                    let raw = &data[local..local + section_size];
+                    let section = if is_64 {
+                        Section64::read_from_prefix(raw).unwrap().0
+                    } else {
+                        let u = |i| crate::util::read_u32_le(&raw[i..]);
+                        Section64 {
+                            sectname: raw[..16].try_into().unwrap(),
+                            segname: raw[16..32].try_into().unwrap(),
+                            addr: u(32) as u64,
+                            size: u(36) as u64,
+                            offset: u(40),
+                            align: u(44),
+                            reloff: u(48),
+                            nreloc: u(52),
+                            flags: u(56),
+                            reserved1: u(60),
+                            reserved2: u(64),
+                            reserved3: 0,
+                        }
+                    };
+                    sections.push(SectionInfo {
+                        section,
+                        struct_offset: offset + local,
+                    });
+                }
                 Ok(LoadCommandInfo::Segment(SegmentInfo {
-                    command: seg.clone(),
+                    command: seg,
                     command_offset: offset,
                     sections,
                 }))
@@ -695,7 +862,7 @@ impl MachOContext {
     /// Updates the header in the data buffer.
     pub fn sync_header(&mut self) -> Result<()> {
         let header = self.header.clone();
-        self.write_struct(0, &header)
+        self.write_at(0, &header.as_bytes()[..self.header_size()])
     }
 
     /// Returns the total size of load commands.
@@ -709,7 +876,7 @@ impl MachOContext {
             .text_segment()
             .map(|s| s.command.fileoff as usize)
             .unwrap_or(usize::MAX);
-        let used = MachHeader64::SIZE + self.load_commands_size();
+        let used = self.header_size() + self.load_commands_size();
         text.saturating_sub(used)
     }
 

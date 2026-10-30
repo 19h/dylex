@@ -239,7 +239,12 @@ impl DyldContext {
     /// File ranges mapped by more than one image, keyed by `(vmaddr, filesize)`.
     fn shared_segment_ranges(&self) -> HashSet<(u64, u64)> {
         let mut counts: HashMap<(u64, u64), u32> = HashMap::new();
+        let mut image_addresses = HashSet::new();
         for image in &self.images {
+            // Install-name aliases identify one image, not shared ownership.
+            if !image_addresses.insert(image.address) {
+                continue;
+            }
             let Ok(header) = self.image_header(image.address) else {
                 continue;
             };

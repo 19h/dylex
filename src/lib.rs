@@ -8,7 +8,8 @@
 //!
 //! - Fast memory-mapped file I/O
 //! - Support for split caches (iOS 15+, macOS 12+)
-//! - Slide info processing (v2, v3, v5)
+//! - 32-bit ARM and 64-bit Mach-O extraction
+//! - Slide info processing (v1, v2, v3, v4, v5)
 //! - LINKEDIT optimization
 //! - Stub fixing
 //! - ObjC metadata restoration
@@ -36,6 +37,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod arm;
 pub mod arm64;
 pub mod converter;
 pub mod dyld;
@@ -306,34 +308,12 @@ struct ImageToExtract {
 /// This reads the image directly from the cache and parses its load commands
 /// to find LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, etc.
 fn get_image_dependencies(cache: &DyldContext, image_path: &str) -> Result<Vec<String>> {
-    use macho::MachHeader64;
-    use zerocopy::FromBytes;
-
-    // Find the image
     let image = cache
         .find_image(image_path)
         .ok_or_else(|| Error::ImageNotFound {
-            name: image_path.to_string(),
+            name: image_path.into(),
         })?;
-
-    // Read the Mach-O header
-    let header_data = cache.data_at_addr(image.address, MachHeader64::SIZE)?;
-    let header = MachHeader64::read_from_prefix(header_data)
-        .map_err(|_| Error::InvalidMachoMagic(0))?
-        .0;
-
-    // Calculate size for header + load commands
-    let header_and_cmds_size = MachHeader64::SIZE + header.sizeofcmds as usize;
-    let header_and_cmds = cache.data_at_addr(image.address, header_and_cmds_size)?;
-
-    // Create a temporary MachOContext to parse load commands
-    let macho_offset =
-        cache
-            .addr_to_offset(image.address)
-            .ok_or_else(|| Error::AddressNotFound {
-                addr: image.address,
-            })? as usize;
-    let macho = MachOContext::new(header_and_cmds, macho_offset)?;
+    let macho = cache.image_header(image.address)?;
 
     Ok(macho.dependencies())
 }

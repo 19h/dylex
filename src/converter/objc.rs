@@ -98,8 +98,10 @@ pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .any(|v| v);
+    let width = ctx.macho.pointer_size();
     let mut builder = ObjcBuilder {
         cache: &cache,
+        width,
         opts: cache.objc_optimization()?,
         base,
         category_class_properties,
@@ -111,11 +113,11 @@ pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
     let mut patches = Vec::new();
     let mut classes = HashSet::new();
     for (kind, start, size) in roots {
-        if size % 8 != 0 {
+        if size % width as u64 != 0 {
             return Err(invalid("misaligned ObjC pointer section"));
         }
         cache.data_at_addr(start, size as usize)?;
-        for slot in (start..start + size).step_by(8) {
+        for slot in (start..start + size).step_by(width) {
             let addr = clean(cache.pointer_at(slot)?);
             tracing::debug!("ObjC root {kind} at {slot:#x} -> {addr:#x}");
             if addr == 0 {
@@ -123,21 +125,29 @@ pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
             }
             match kind.as_str() {
                 "__objc_classlist" | "__objc_nlclslist" => {
-                    let mut pending = vec![addr];
-                    while let Some(class) = pending.pop() {
-                        if !classes.insert(class) || !ctx.macho.contains_addr(class) {
+                    let mut pending = vec![(addr, slot)];
+                    while let Some((class, reference)) = pending.pop() {
+                        if !ctx.macho.contains_addr(class) {
+                            // Older builders coalesce a few class/metaclass objects
+                            // outside the defining image's segments.
+                            patches.push((reference, builder.class(class)?));
                             continue;
                         }
-                        cache.data_at_addr(class, 40)?;
-                        let ro = clean(cache.pointer_at(class + 32)?) & !7;
+                        if !classes.insert(class) {
+                            continue;
+                        }
+                        cache.data_at_addr(class, 5 * width)?;
+                        let data_field = class + (4 * width) as u64;
+                        let mask = if width == 4 { 3 } else { 7 };
+                        let ro = clean(cache.pointer_at(data_field)?) & !mask;
                         if ro != 0 {
                             let new_ro = builder.class_ro(ro)?;
-                            let bits = cache.pointer_at(class + 32)? & 7;
-                            patches.push((class + 32, new_ro | bits));
+                            let bits = cache.pointer_at(data_field)? & mask;
+                            patches.push((data_field, new_ro | bits));
                         }
                         let isa = clean(cache.pointer_at(class)?);
                         if isa != 0 && isa != class {
-                            pending.push(isa);
+                            pending.push((isa, class));
                         }
                     }
                 }
@@ -160,7 +170,7 @@ pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
             .macho
             .addr_to_offset(addr)
             .ok_or(Error::AddressNotFound { addr })?;
-        ctx.macho.write_u64(offset, value)?;
+        ctx.macho.write_pointer(offset, value)?;
     }
     let image_infos: Vec<_> = ctx
         .macho
@@ -183,6 +193,7 @@ pub fn fix_objc(ctx: &mut ExtractionContext) -> Result<()> {
 
 struct ObjcBuilder<'a> {
     cache: &'a DyldContext,
+    width: usize,
     opts: Option<ObjcOptimization>,
     base: u64,
     data: Vec<u8>,
@@ -206,12 +217,17 @@ impl ObjcBuilder<'_> {
             .ok_or_else(|| invalid("ObjC output exceeds file offset limit"))?;
         self.base
             .checked_add(end as u64)
+            .filter(|v| self.width == 8 || *v <= u32::MAX as u64)
             .ok_or_else(|| invalid("ObjC output address overflow"))?;
         self.data.resize(end, 0);
         Ok((self.base + off as u64, off))
     }
-    fn put(&mut self, off: usize, value: u64) {
-        self.data[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    fn put(&mut self, off: usize, value: u64) -> Result<()> {
+        if self.width == 4 && value > u32::MAX as u64 {
+            return Err(invalid("32-bit ObjC pointer overflow"));
+        }
+        self.data[off..off + self.width].copy_from_slice(&value.to_le_bytes()[..self.width]);
+        Ok(())
     }
     fn ptr(&self, addr: u64) -> Result<u64> {
         Ok(clean(self.cache.pointer_at(addr).map_err(|e| {
@@ -237,7 +253,7 @@ impl ObjcBuilder<'_> {
     fn string_field(&mut self, src: u64, dst: usize) -> Result<()> {
         let ptr = self.ptr(src)?;
         let value = self.string(ptr)?;
-        self.put(dst, value);
+        self.put(dst, value)?;
         Ok(())
     }
     fn record(&mut self, addr: u64, size: usize, pointers: &[usize]) -> Result<(u64, usize)> {
@@ -249,108 +265,135 @@ impl ObjcBuilder<'_> {
         self.data[off..off + size].copy_from_slice(bytes);
         for &field in pointers {
             let p = self.ptr(addr + field as u64)?;
-            self.put(off + field, p);
+            self.put(off + field, p)?;
         }
         Ok((value, off))
+    }
+    fn class(&mut self, addr: u64) -> Result<u64> {
+        if addr == 0 {
+            return Ok(0);
+        }
+        if let Some(&value) = self.objects.get(&(addr, 7)) {
+            return Ok(value);
+        }
+        let w = self.width;
+        let (value, off) = self.record(addr, 5 * w, &[0, w, 4 * w])?;
+        self.objects.insert((addr, 7), value);
+        let isa = self.class(self.ptr(addr)?)?;
+        self.put(off, isa)?;
+        let superclass = self.class(self.ptr(addr + w as u64)?)?;
+        self.put(off + w, superclass)?;
+        let bits = self.ptr(addr + (4 * w) as u64)?;
+        let mask = if w == 4 { 3 } else { 7 };
+        let ro = self.class_ro(bits & !mask)?;
+        self.put(off + 4 * w, ro | (bits & mask))?;
+        Ok(value)
     }
     fn class_ro(&mut self, addr: u64) -> Result<u64> {
         tracing::debug!("class_ro {addr:#x}");
         if let Some(&value) = self.objects.get(&(addr, 0)) {
             return Ok(value);
         }
-        let (value, off) = self.record(addr, 72, &[16, 24, 32, 40, 48, 56, 64])?;
+        let w = self.width;
+        let prefix = if w == 8 { 16 } else { 12 };
+        let fields: Vec<_> = (0..7).map(|i| prefix + i * w).collect();
+        let (value, off) = self.record(addr, prefix + 7 * w, &fields)?;
         self.objects.insert((addr, 0), value);
-        for field in [16, 24, 56] {
+        for field in [fields[0], fields[1], fields[5]] {
             self.string_field(addr + field as u64, off + field)?;
         }
-        let methods = self.methods(self.ptr(addr + 32)?)?;
-        self.put(off + 32, methods);
-        let protocols = self.protocol_list(self.ptr(addr + 40)?)?;
-        self.put(off + 40, protocols);
-        let ivars = self.fields(self.ptr(addr + 48)?, true)?;
-        self.put(off + 48, ivars);
-        let properties = self.fields(self.ptr(addr + 64)?, false)?;
-        self.put(off + 64, properties);
+        let methods = self.methods(self.ptr(addr + fields[2] as u64)?)?;
+        self.put(off + fields[2], methods)?;
+        let protocols = self.protocol_list(self.ptr(addr + fields[3] as u64)?)?;
+        self.put(off + fields[3], protocols)?;
+        let ivars = self.fields(self.ptr(addr + fields[4] as u64)?, true)?;
+        self.put(off + fields[4], ivars)?;
+        let properties = self.fields(self.ptr(addr + fields[6] as u64)?, false)?;
+        self.put(off + fields[6], properties)?;
         Ok(value)
     }
     fn category(&mut self, addr: u64) -> Result<u64> {
         if let Some(&value) = self.objects.get(&(addr, 1)) {
             return Ok(value);
         }
+        let w = self.width;
         let size = if self.category_class_properties {
-            56
+            7 * w
         } else {
-            48
+            6 * w
         };
-        let (value, off) = self.record(addr, size, &[0, 8, 16, 24, 32, 40])?;
+        let fields: Vec<_> = (0..size / w).map(|i| i * w).collect();
+        let (value, off) = self.record(addr, size, &fields)?;
         self.objects.insert((addr, 1), value);
         self.string_field(addr, off)?;
-        for field in [16, 24] {
-            let methods = self.methods(self.ptr(addr + field)?)?;
-            self.put(off + field as usize, methods);
+        for field in [2 * w, 3 * w] {
+            let methods = self.methods(self.ptr(addr + field as u64)?)?;
+            self.put(off + field, methods)?;
         }
-        let protocols = self.protocol_list(self.ptr(addr + 32)?)?;
-        self.put(off + 32, protocols);
-        let properties = self.fields(self.ptr(addr + 40)?, false)?;
-        self.put(off + 40, properties);
+        let protocols = self.protocol_list(self.ptr(addr + (4 * w) as u64)?)?;
+        self.put(off + 4 * w, protocols)?;
+        let properties = self.fields(self.ptr(addr + (5 * w) as u64)?, false)?;
+        self.put(off + 5 * w, properties)?;
         if self.category_class_properties {
-            let properties = self.fields(self.ptr(addr + 48)?, false)?;
-            self.put(off + 48, properties);
+            let properties = self.fields(self.ptr(addr + (6 * w) as u64)?, false)?;
+            self.put(off + 6 * w, properties)?;
         }
         Ok(value)
     }
     fn protocol(&mut self, addr: u64) -> Result<u64> {
+        tracing::debug!("ObjC protocol {addr:#x}");
         if addr == 0 {
             return Ok(0);
         }
         if let Some(&value) = self.objects.get(&(addr, 2)) {
             return Ok(value);
         }
-        let prefix = self.cache.data_at_addr(addr, 72)?;
-        let size = read_u32_le(&prefix[64..]) as usize;
-        if !(72..=4096).contains(&size) {
+        let w = self.width;
+        let minimum = 8 * w + 8;
+        let prefix = self.cache.data_at_addr(addr, minimum)?;
+        let size = read_u32_le(&prefix[8 * w..]) as usize;
+        if !(minimum..=4096).contains(&size) {
             return Err(invalid("invalid ObjC protocol size"));
         }
-        let (value, off) = self.record(addr, size, &[0, 8, 16, 24, 32, 40, 48, 56])?;
+        let fields: Vec<_> = (0..8).map(|i| i * w).collect();
+        let (value, off) = self.record(addr, size, &fields)?;
         self.objects.insert((addr, 2), value);
-        self.string_field(addr + 8, off + 8)?;
-        let protocols = self.protocol_list(self.ptr(addr + 16)?)?;
-        self.put(off + 16, protocols);
+        self.string_field(addr + w as u64, off + w)?;
+        let protocols = self.protocol_list(self.ptr(addr + (2 * w) as u64)?)?;
+        self.put(off + 2 * w, protocols)?;
         let mut count = 0;
-        for field in [24, 32, 40, 48] {
-            let methods = self.methods(self.ptr(addr + field)?)?;
+        for field in (3..7).map(|i| i * w) {
+            let methods = self.methods(self.ptr(addr + field as u64)?)?;
             if methods != 0 {
                 count += read_u32_le(&self.data[(methods - self.base) as usize + 4..]) as usize;
             }
-            self.put(off + field as usize, methods);
+            self.put(off + field, methods)?;
         }
-        let properties = self.fields(self.ptr(addr + 56)?, false)?;
-        self.put(off + 56, properties);
-        if size >= 80 {
-            let types = self.ptr(addr + 72)?;
+        let properties = self.fields(self.ptr(addr + (7 * w) as u64)?, false)?;
+        self.put(off + 7 * w, properties)?;
+        if size >= minimum + w {
+            let types = self.ptr(addr + minimum as u64)?;
             let new_types = if types == 0 {
                 0
             } else {
-                self.cache.data_at_addr(
-                    types,
-                    count
-                        .checked_mul(8)
-                        .ok_or_else(|| invalid("protocol type count overflow"))?,
-                )?;
-                let (v, o) = self.reserve(count * 8)?;
+                let bytes = count
+                    .checked_mul(w)
+                    .ok_or_else(|| invalid("protocol type count overflow"))?;
+                self.cache.data_at_addr(types, bytes)?;
+                let (v, o) = self.reserve(bytes)?;
                 for i in 0..count {
-                    self.string_field(types + (i * 8) as u64, o + i * 8)?;
+                    self.string_field(types + (i * w) as u64, o + i * w)?;
                 }
                 v
             };
-            self.put(off + 72, new_types);
+            self.put(off + minimum, new_types)?;
         }
-        if size >= 88 {
-            self.string_field(addr + 80, off + 80)?;
+        if size >= minimum + 2 * w {
+            self.string_field(addr + (minimum + w) as u64, off + minimum + w)?;
         }
-        if size >= 96 {
-            let props = self.fields(self.ptr(addr + 88)?, false)?;
-            self.put(off + 88, props);
+        if size >= minimum + 3 * w {
+            let props = self.fields(self.ptr(addr + (minimum + 2 * w) as u64)?, false)?;
+            self.put(off + minimum + 2 * w, props)?;
         }
         Ok(value)
     }
@@ -407,7 +450,7 @@ impl ObjcBuilder<'_> {
             if count == 0 {
                 continue;
             }
-            if stride < if relative { 12 } else { 24 } {
+            if stride < if relative { 12 } else { 3 * self.width } {
                 return Err(invalid(&format!(
                     "invalid method entry size at {list:#x}: flags={flags:#x}, count={count}"
                 )));
@@ -425,26 +468,28 @@ impl ObjcBuilder<'_> {
                 } else {
                     (
                         self.ptr(field)?,
-                        self.ptr(field + 8)?,
-                        self.ptr(field + 16)?,
+                        self.ptr(field + self.width as u64)?,
+                        self.ptr(field + (2 * self.width) as u64)?,
                     )
                 };
                 methods.push((self.string(name)?, self.string(types)?, imp));
             }
         }
         let count = u32::try_from(methods.len()).map_err(|_| invalid("method count overflow"))?;
-        let (value, off) = self.reserve(8 + methods.len() * 24)?;
-        self.data[off..off + 4].copy_from_slice(&24u32.to_le_bytes());
+        let stride = 3 * self.width;
+        let (value, off) = self.reserve(8 + methods.len() * stride)?;
+        self.data[off..off + 4].copy_from_slice(&(stride as u32).to_le_bytes());
         self.data[off + 4..off + 8].copy_from_slice(&count.to_le_bytes());
         for (i, (name, types, imp)) in methods.into_iter().enumerate() {
-            self.put(off + 8 + i * 24, name);
-            self.put(off + 16 + i * 24, types);
-            self.put(off + 24 + i * 24, imp);
+            self.put(off + 8 + i * stride, name)?;
+            self.put(off + 8 + self.width + i * stride, types)?;
+            self.put(off + 8 + 2 * self.width + i * stride, imp)?;
         }
         self.objects.insert((addr, 3), value);
         Ok(value)
     }
     fn protocol_list(&mut self, addr: u64) -> Result<u64> {
+        tracing::debug!("ObjC protocol list {addr:#x}");
         if addr == 0 {
             return Ok(0);
         }
@@ -453,28 +498,34 @@ impl ObjcBuilder<'_> {
         }
         let mut protocols = Vec::new();
         for list in self.lists(addr, 4)? {
-            let count = usize::try_from(read_u64_le(self.cache.data_at_addr(list, 8)?))
-                .map_err(|_| invalid("protocol list count overflow"))?;
+            let raw_count = self.cache.data_at_addr(list, self.width)?;
+            let count = usize::try_from(if self.width == 4 {
+                read_u32_le(raw_count) as u64
+            } else {
+                read_u64_le(raw_count)
+            })
+            .map_err(|_| invalid("protocol list count overflow"))?;
             self.cache.data_at_addr(
-                list + 8,
+                list + self.width as u64,
                 count
-                    .checked_mul(8)
+                    .checked_mul(self.width)
                     .ok_or_else(|| invalid("protocol list size overflow"))?,
             )?;
             for i in 0..count {
-                protocols.push(self.ptr(list + 8 + (i * 8) as u64)?);
+                protocols.push(self.ptr(list + self.width as u64 + (i * self.width) as u64)?);
             }
         }
-        let (value, off) = self.reserve(8 + protocols.len() * 8)?;
+        let (value, off) = self.reserve(self.width + protocols.len() * self.width)?;
         self.objects.insert((addr, 4), value);
-        self.put(off, protocols.len() as u64);
+        self.put(off, protocols.len() as u64)?;
         for (i, p) in protocols.into_iter().enumerate() {
             let v = self.protocol(p)?;
-            self.put(off + 8 + i * 8, v);
+            self.put(off + self.width + i * self.width, v)?;
         }
         Ok(value)
     }
     fn fields(&mut self, addr: u64, ivars: bool) -> Result<u64> {
+        tracing::debug!("ObjC field list {addr:#x}, ivars={ivars}");
         if addr == 0 {
             return Ok(0);
         }
@@ -482,7 +533,11 @@ impl ObjcBuilder<'_> {
         if let Some(&value) = self.objects.get(&(addr, kind)) {
             return Ok(value);
         }
-        let stride = if ivars { 32 } else { 16 };
+        let stride = if ivars {
+            3 * self.width + 8
+        } else {
+            2 * self.width
+        };
         let mut entries = Vec::new();
         for list in self.lists(addr, kind)? {
             let h = self.cache.data_at_addr(list, 8)?;
@@ -518,13 +573,13 @@ impl ObjcBuilder<'_> {
                     let bytes = self.cache.data_at_addr(ptr, 4)?;
                     let (v, o) = self.reserve(4)?;
                     self.data[o..o + 4].copy_from_slice(bytes);
-                    self.put(dst, v);
+                    self.put(dst, v)?;
                 }
-                self.string_field(src + 8, dst + 8)?;
-                self.string_field(src + 16, dst + 16)?;
+                self.string_field(src + self.width as u64, dst + self.width)?;
+                self.string_field(src + (2 * self.width) as u64, dst + 2 * self.width)?;
             } else {
                 self.string_field(src, dst)?;
-                self.string_field(src + 8, dst + 8)?;
+                self.string_field(src + self.width as u64, dst + self.width)?;
             }
         }
         self.objects.insert((addr, kind), value);

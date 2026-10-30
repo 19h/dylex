@@ -178,6 +178,8 @@ pub struct SubcacheFile {
 // Dyld Context
 // =============================================================================
 
+type ArmSlidePage = std::sync::Arc<Vec<(u16, u32)>>;
+
 /// Main context for working with a dyld shared cache.
 ///
 /// This struct holds all the state needed to read and extract images from
@@ -202,6 +204,9 @@ pub struct DyldContext {
     pub local_symbols_info: Option<DyldCacheLocalSymbolsInfo>,
     /// Shared region start address
     pub shared_region_start: u64,
+    // Page-local decoded ARM words. Unlisted pointer fields retain their raw
+    // value; cache builders can leave optional ObjC fields outside slide chains.
+    pub(crate) slide32_pages: std::sync::Mutex<std::collections::HashMap<u64, ArmSlidePage>>,
 }
 
 impl DyldContext {
@@ -239,6 +244,7 @@ impl DyldContext {
             symbols_file: None,
             local_symbols_info: None,
             shared_region_start: 0,
+            slide32_pages: Default::default(),
         };
 
         // Store shared region start if available

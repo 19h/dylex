@@ -186,67 +186,25 @@ fn build_image_address_map(cache: &DyldContext) -> Vec<ImageAddressRange> {
     let mut ranges = Vec::new();
 
     for image in cache.iter_images() {
-        // Get image's segment ranges
-        if let Ok((start, end)) = get_image_address_range(cache, &image.path) {
-            ranges.push(ImageAddressRange {
-                path: image.path.clone(),
-                start,
-                end,
-            });
+        if let Ok(header) = cache.image_header(image.address) {
+            for segment in header
+                .segments()
+                .filter(|s| s.name() != "__LINKEDIT" && s.command.vmsize != 0)
+            {
+                if let Some(end) = segment.command.vmaddr.checked_add(segment.command.vmsize) {
+                    ranges.push(ImageAddressRange {
+                        path: image.path.clone(),
+                        start: segment.command.vmaddr,
+                        end,
+                    });
+                }
+            }
         }
     }
 
     // Sort by start address for binary search
     ranges.sort_by_key(|r| r.start);
     ranges
-}
-
-/// Gets the address range (min vmaddr, max vmaddr+vmsize) of an image.
-fn get_image_address_range(cache: &DyldContext, image_path: &str) -> Result<(u64, u64)> {
-    let image = cache
-        .find_image(image_path)
-        .ok_or_else(|| Error::ImageNotFound {
-            name: image_path.to_string(),
-        })?;
-
-    let header_data = cache.data_at_addr(image.address, MachHeader64::SIZE)?;
-    let header = MachHeader64::read_from_prefix(header_data)
-        .map_err(|_| Error::InvalidMachoMagic(0))?
-        .0;
-
-    let header_and_cmds_size = MachHeader64::SIZE + header.sizeofcmds as usize;
-    let header_and_cmds = cache.data_at_addr(image.address, header_and_cmds_size)?;
-
-    let mut min_addr = u64::MAX;
-    let mut max_addr = 0u64;
-
-    let mut offset = MachHeader64::SIZE;
-    for _ in 0..header.ncmds {
-        if offset + 8 > header_and_cmds.len() {
-            break;
-        }
-        // Optimized: single unaligned loads
-        let cmd = crate::util::read_u32_le(&header_and_cmds[offset..]);
-        let cmdsize = crate::util::read_u32_le(&header_and_cmds[offset + 4..]) as usize;
-
-        if cmd == LC_SEGMENT_64 && offset + SegmentCommand64::SIZE <= header_and_cmds.len() {
-            let vmaddr = crate::util::read_u64_le(&header_and_cmds[offset + 24..]);
-            let vmsize = crate::util::read_u64_le(&header_and_cmds[offset + 32..]);
-
-            if vmsize > 0 {
-                min_addr = min_addr.min(vmaddr);
-                max_addr = max_addr.max(vmaddr + vmsize);
-            }
-        }
-        offset += cmdsize;
-    }
-
-    if min_addr == u64::MAX {
-        min_addr = image.address;
-        max_addr = image.address + 0x1000; // Default to 1 page
-    }
-
-    Ok((min_addr, max_addr))
 }
 
 /// Finds which image (if any) contains the given address.
@@ -279,133 +237,45 @@ fn scan_image_pointers(
         None => return referenced,
     };
 
-    let header_data = match cache.data_at_addr(image.address, MachHeader64::SIZE) {
-        Ok(data) => data,
-        Err(_) => return referenced,
+    let Ok(header) = cache.image_header(image.address) else {
+        return referenced;
     };
-
-    let header = match MachHeader64::read_from_prefix(header_data) {
-        Ok((h, _)) => h,
-        Err(_) => return referenced,
-    };
-
-    let header_and_cmds_size = MachHeader64::SIZE + header.sizeofcmds as usize;
-    let header_and_cmds = match cache.data_at_addr(image.address, header_and_cmds_size) {
-        Ok(data) => data,
-        Err(_) => return referenced,
-    };
-
-    let mut sections_scanned = 0usize;
-    let mut pointers_scanned = 0usize;
-
-    // Parse all segments and their sections
-    let mut offset = MachHeader64::SIZE;
-    for _ in 0..header.ncmds {
-        if offset + 8 > header_and_cmds.len() {
-            break;
-        }
-        let cmd = u32::from_le_bytes(header_and_cmds[offset..offset + 4].try_into().unwrap());
-        let cmdsize =
-            u32::from_le_bytes(header_and_cmds[offset + 4..offset + 8].try_into().unwrap())
-                as usize;
-
-        if cmd == LC_SEGMENT_64 && offset + SegmentCommand64::SIZE <= header_and_cmds.len() {
-            let nsects = u32::from_le_bytes(
-                header_and_cmds[offset + 64..offset + 68]
-                    .try_into()
-                    .unwrap(),
-            );
-
-            // Process each section in this segment
-            let mut sect_offset = offset + SegmentCommand64::SIZE;
-            for _ in 0..nsects {
-                if sect_offset + Section64::SIZE > header_and_cmds.len() {
-                    break;
-                }
-
-                let sect = match Section64::read_from_prefix(&header_and_cmds[sect_offset..]) {
-                    Ok((s, _)) => s,
-                    Err(_) => {
-                        sect_offset += Section64::SIZE;
-                        continue;
-                    }
-                };
-
-                // Check if this section contains pointers
-                if section_has_pointers(sect.name(), sect.segment_name()) {
-                    // Read section data and scan for pointers
-                    if let Ok(sect_data) = cache.data_at_addr(sect.addr, sect.size as usize) {
-                        sections_scanned += 1;
-                        let before = referenced.len();
-                        scan_section_pointers(sect_data, &sect, ranges, &mut referenced);
-                        pointers_scanned += sect_data.len() / 8;
-                        if verbosity >= 3 {
-                            debug!(
-                                "  Section {}.{} @ 0x{:x} ({} bytes) -> {} new refs",
-                                sect.segment_name(),
-                                sect.name(),
-                                sect.addr,
-                                sect.size,
-                                referenced.len() - before
-                            );
-                        }
+    for segment in header.segments().filter(|s| s.name() != "__LINKEDIT") {
+        for section in &segment.sections {
+            let s = &section.section;
+            if !section_has_pointers(s.name(), s.segment_name()) || s.name().contains("stub") {
+                continue;
+            }
+            let Some(delta) = s.addr.checked_sub(segment.command.vmaddr) else {
+                continue;
+            };
+            if delta
+                .checked_add(s.size)
+                .is_none_or(|end| end > segment.command.filesize)
+            {
+                continue;
+            }
+            for offset in (0..s.size.saturating_sub(header.pointer_size() as u64 - 1))
+                .step_by(header.pointer_size())
+            {
+                if let Ok(value) = cache.pointer_at(s.addr + offset) {
+                    if let Some(path) =
+                        find_image_for_address(value & crate::util::ADDR_MASK_48BIT, ranges)
+                    {
+                        referenced.insert(path.to_owned());
                     }
                 }
-
-                sect_offset += Section64::SIZE;
             }
         }
-        offset += cmdsize;
     }
-
     if verbosity >= 2 {
         debug!(
-            "Scanned {} sections, {} pointers in {} - found {} referenced images",
-            sections_scanned,
-            pointers_scanned,
-            image_path,
-            referenced.len()
+            "Found {} referenced images in {}",
+            referenced.len(),
+            image_path
         );
     }
-
     referenced
-}
-
-/// Scans a section's data for pointer values and adds referenced images to the set.
-///
-/// # Performance
-///
-/// Uses optimized u64 reads that compile to single unaligned load instructions.
-/// The inner loop is kept simple for LLVM auto-vectorization.
-fn scan_section_pointers(
-    data: &[u8],
-    sect: &Section64,
-    ranges: &[ImageAddressRange],
-    referenced: &mut HashSet<String>,
-) {
-    let sect_name = sect.name();
-
-    // Stubs have code, not raw pointers - skip
-    if sect_name.contains("stub") {
-        return;
-    }
-
-    // Use optimized pointer scanning from util module
-    // This uses fast u64 reads and early-exit for null/small values
-    for (_offset, ptr_value) in crate::util::scan_pointers_in_range(
-        data,
-        8, // 64-bit pointer stride
-        crate::util::MIN_VALID_POINTER,
-        u64::MAX,
-    ) {
-        // Strip pointer authentication bits (top byte on arm64e)
-        let clean_ptr = ptr_value & crate::util::ADDR_MASK_48BIT;
-
-        // Find which image this pointer references
-        if let Some(target_path) = find_image_for_address(clean_ptr, ranges) {
-            referenced.insert(target_path.to_string());
-        }
-    }
 }
 
 /// Gets the LC_LOAD_DYLIB dependencies of an image.
@@ -415,31 +285,10 @@ fn get_image_dependencies(cache: &DyldContext, image_path: &str) -> Vec<String> 
         None => return Vec::new(),
     };
 
-    let header_data = match cache.data_at_addr(image.address, MachHeader64::SIZE) {
-        Ok(data) => data,
-        Err(_) => return Vec::new(),
-    };
-
-    let header = match MachHeader64::read_from_prefix(header_data) {
-        Ok((h, _)) => h,
-        Err(_) => return Vec::new(),
-    };
-
-    let header_and_cmds_size = MachHeader64::SIZE + header.sizeofcmds as usize;
-    let header_and_cmds = match cache.data_at_addr(image.address, header_and_cmds_size) {
-        Ok(data) => data,
-        Err(_) => return Vec::new(),
-    };
-
-    let macho_offset = match cache.addr_to_offset(image.address) {
-        Some(o) => o as usize,
-        None => return Vec::new(),
-    };
-
-    match MachOContext::new(header_and_cmds, macho_offset) {
-        Ok(macho) => macho.dependencies(),
-        Err(_) => Vec::new(),
-    }
+    cache
+        .image_header(image.address)
+        .map(|m| m.dependencies())
+        .unwrap_or_default()
 }
 
 /// Discovers all images to merge using BOTH LC_LOAD_DYLIB AND pointer scanning (BFS up to max_depth).
@@ -814,6 +663,10 @@ fn parse_segments(data: &[u8]) -> Result<Vec<SegmentInfo>> {
 /// segments for each dependency. All pointers are updated to reference the
 /// merged locations.
 pub fn merge_images(ctx: &mut MergeContext) -> Result<()> {
+    if ctx.cache.pointer_size() == 4 {
+        return merge_arm32_images(ctx);
+    }
+
     let primary_path = ctx.primary_path.clone();
 
     // Discover all images to merge
@@ -1181,6 +1034,11 @@ fn find_section(data: &[u8], seg_name: &str, sect_name: &str) -> Option<Section6
 
 /// Fixes auth stubs to use the local GOT and populates GOT entries.
 pub fn fix_merged_stubs(ctx: &mut MergeContext) -> Result<()> {
+    // ARM32 is already assembled by merge_arm32_images at original cache VAs.
+    if ctx.cache.pointer_size() == 4 {
+        return Ok(());
+    }
+
     let header = MachHeader64::read_from_prefix(&ctx.data)
         .map_err(|_| Error::InvalidMachoMagic(0))?
         .0;
@@ -1324,6 +1182,11 @@ pub fn fix_merged_stubs(ctx: &mut MergeContext) -> Result<()> {
 /// Uses optimized u64 reads/writes that compile to single unaligned load/store
 /// instructions. The inner loop is kept simple for LLVM auto-vectorization potential.
 pub fn fix_merged_pointers(ctx: &mut MergeContext) -> Result<()> {
+    // ARM32 is already assembled by merge_arm32_images at original cache VAs.
+    if ctx.cache.pointer_size() == 4 {
+        return Ok(());
+    }
+
     use byteorder::{ByteOrder, LittleEndian};
 
     // Parse sections that contain pointers
@@ -1409,6 +1272,11 @@ pub fn fix_merged_pointers(ctx: &mut MergeContext) -> Result<()> {
 ///
 /// For TEXT segments, a __text section is added so IDA recognizes the code.
 pub fn inject_dependency_segments(ctx: &mut MergeContext) -> Result<()> {
+    // ARM32 is already assembled by merge_arm32_images at original cache VAs.
+    if ctx.cache.pointer_size() == 4 {
+        return Ok(());
+    }
+
     if ctx.dependency_segments.is_empty() {
         return Ok(());
     }
@@ -1586,6 +1454,11 @@ pub fn inject_dependency_segments(ctx: &mut MergeContext) -> Result<()> {
 /// This rewrites LC_SEGMENT_64 file offsets to match the compact layout,
 /// clears the MH_DYLIB_IN_CACHE flag, and zeros out chained fixups.
 pub fn update_merged_load_commands(ctx: &mut MergeContext) -> Result<()> {
+    // ARM32 is already assembled by merge_arm32_images at original cache VAs.
+    if ctx.cache.pointer_size() == 4 {
+        return Ok(());
+    }
+
     if ctx.data.len() < MachHeader64::SIZE {
         return Err(Error::BufferTooSmall {
             needed: MachHeader64::SIZE,
@@ -2084,6 +1957,11 @@ fn read_function_starts(cache: &DyldContext, image_path: &str) -> Result<Vec<u8>
 /// 3. Merged symbol table (symbols from all images with adjusted addresses)
 /// 4. Merged string table
 pub fn rebuild_merged_linkedit(ctx: &mut MergeContext) -> Result<()> {
+    // ARM32 is already assembled by merge_arm32_images at original cache VAs.
+    if ctx.cache.pointer_size() == 4 {
+        return Ok(());
+    }
+
     let mut builder = LinkeditBuilder::new();
 
     // Read function starts from primary image
@@ -2566,6 +2444,11 @@ pub fn scan_shared_region_refs(ctx: &MergeContext) -> Vec<(u64, u64)> {
 /// Includes shared cache DATA regions in the merged output.
 /// This copies the data from the cache and adds segment commands.
 pub fn include_shared_regions(ctx: &mut MergeContext) -> Result<()> {
+    // ARM32 is already assembled by merge_arm32_images at original cache VAs.
+    if ctx.cache.pointer_size() == 4 {
+        return Ok(());
+    }
+
     let regions = scan_shared_region_refs(ctx);
 
     if regions.is_empty() {
@@ -2709,6 +2592,11 @@ fn decode_shared_pointer(cache: &DyldContext, addr: u64, raw: u64) -> u64 {
 /// Resolves indirect pointers in GOT, auth, and selector sections.
 /// This rewrites pointers to point directly to their targets.
 pub fn resolve_indirect_pointers(ctx: &mut MergeContext) -> Result<()> {
+    // ARM32 is already assembled by merge_arm32_images at original cache VAs.
+    if ctx.cache.pointer_size() == 4 {
+        return Ok(());
+    }
+
     let mut resolved_count = 0usize;
 
     // Parse the header to find pointer sections
@@ -2933,4 +2821,52 @@ mod tests {
             "/usr/lib/libfoo.dylib"
         );
     }
+}
+
+// Preserve source ARM/Thumb PCs and state bits: moving code would require
+// rewriting every PC-relative instruction and literal pool. Use the same
+// section/symbol merger as explicit-image extraction, with legacy BFS selection.
+fn merge_arm32_images(ctx: &mut MergeContext) -> Result<()> {
+    let primary = ctx.cache.resolve_image(&ctx.primary_path)?.path.clone();
+    let mut seen_addresses = HashSet::new();
+    let selected: Vec<_> = discover_images_to_merge(&ctx.cache, &primary, ctx.max_depth)
+        .into_iter()
+        .filter(|(path, _)| {
+            ctx.cache
+                .find_image(path)
+                .is_some_and(|image| seen_addresses.insert(image.address))
+        })
+        .collect();
+    let additions: Vec<_> = selected
+        .iter()
+        .skip(1)
+        .map(|(path, _)| path.clone())
+        .collect();
+    let mut extraction =
+        super::selected::prepare_selected_images(&ctx.cache, &primary, &additions, ctx.verbosity)?;
+    let writes = super::optimize_offsets(&mut extraction)?;
+    let data = super::writer::assemble_macho(&extraction, &writes)?;
+    let mut mappings = Vec::new();
+    for (path, _) in selected {
+        let image = ctx.cache.resolve_image(&path)?;
+        let header = ctx.cache.image_header(image.address)?;
+        let mut segments = HashMap::new();
+        let mut end = image.address;
+        for segment in header.segments().filter(|s| s.name() != "__LINKEDIT") {
+            let c = segment.command;
+            segments.insert(segment.name().into(), (c.vmaddr, c.vmaddr, c.vmsize));
+            end = end.max(c.vmaddr + c.vmsize);
+        }
+        mappings.push(ImageSegmentMapping {
+            path: path.clone(),
+            original_base: image.address,
+            merged_base: image.address,
+            size: end - image.address,
+            segments,
+        });
+    }
+    ctx.processed = mappings.iter().map(|m| m.path.clone()).collect();
+    ctx.mappings = mappings;
+    ctx.data = data;
+    Ok(())
 }

@@ -2,7 +2,6 @@
 //! offsets are local to each file and can overlap; they are not output offsets.
 use crate::macho::*;
 use crate::{DyldContext, Error, MachOContext, Result};
-use zerocopy::IntoBytes;
 
 /// Copies image segments into a compact, non-overlapping buffer. When rebuilding
 /// LINKEDIT, its original offsets remain in commands until the optimizer reads
@@ -48,8 +47,8 @@ pub fn materialize_image(
         cache.copy_data_at_addr(seg.command.vmaddr, &mut data[new_off..cursor])?;
         let mut cmd = seg.command;
         cmd.fileoff = new_off as u64;
-        data[seg.command_offset..seg.command_offset + SegmentCommand64::SIZE]
-            .copy_from_slice(cmd.as_bytes());
+        let mut target = MachOContext::new(&data, 0)?;
+        target.write_segment(seg.command_offset, &cmd)?;
         for section in &seg.sections {
             let mut sect = section.section;
             if sect.offset != 0 {
@@ -62,9 +61,9 @@ pub fn materialize_image(
                     reason: "section offset overflow".into(),
                 })?;
             }
-            data[section.struct_offset..section.struct_offset + Section64::SIZE]
-                .copy_from_slice(sect.as_bytes());
+            target.write_section(section.struct_offset, &sect)?;
         }
+        data = target.data;
         if seg.name() == "__LINKEDIT" {
             linkedit_move = Some((seg.command.fileoff, new_off as u64));
         }

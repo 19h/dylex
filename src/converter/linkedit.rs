@@ -9,18 +9,13 @@
 //! - Vectors are pre-allocated with capacity hints
 //! - FxHashMap used for fast symbol index lookups
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use zerocopy::{FromBytes, IntoBytes};
-
-use crate::dyld::{
-    DyldCacheLocalSymbolsEntry, DyldCacheLocalSymbolsEntry64, DyldCacheLocalSymbolsInfo,
-};
 use crate::error::{Error, Result};
 use crate::macho::{
     DyldInfoCommand, DysymtabCommand, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_DATA_IN_CODE,
     LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_FUNCTION_STARTS, LinkeditDataCommand,
-    LoadCommandInfo, N_INDR, N_STAB, N_TYPE, Nlist64, SymtabCommand,
+    LoadCommandInfo, N_INDR, N_STAB, N_TYPE, Nlist64, SymtabCommand, append_nlist, read_nlist,
 };
 
 use super::ExtractionContext;
@@ -127,6 +122,7 @@ struct LinkeditOptimizer<'a> {
     // Symbol table indices
     new_local_sym_index: u32,
     new_local_sym_count: u32,
+    local_keys: FxHashSet<(u64, u8, u8, u16, Vec<u8>)>,
     new_extdef_sym_index: u32,
     new_extdef_sym_count: u32,
     new_undef_sym_index: u32,
@@ -176,6 +172,7 @@ impl<'a> LinkeditOptimizer<'a> {
             new_string_pool_size: 0,
             new_local_sym_index: 0,
             new_local_sym_count: 0,
+            local_keys: FxHashSet::default(),
             new_extdef_sym_index: 0,
             new_extdef_sym_count: 0,
             new_undef_sym_index: 0,
@@ -277,7 +274,6 @@ impl<'a> LinkeditOptimizer<'a> {
     }
 
     /// Copies binding info to the new LINKEDIT.
-    #[allow(dead_code)]
     fn copy_binding_info(&mut self) -> Result<()> {
         let Some(dyld_info) = self.dyld_info else {
             return Ok(());
@@ -314,7 +310,6 @@ impl<'a> LinkeditOptimizer<'a> {
     }
 
     /// Copies export info to the new LINKEDIT.
-    #[allow(dead_code)]
     fn copy_export_info(&mut self) -> Result<()> {
         // Check for LC_DYLD_EXPORTS_TRIE first (newer format)
         if let Some(export_trie) = self.export_trie {
@@ -365,13 +360,16 @@ impl<'a> LinkeditOptimizer<'a> {
         let sym_end = sym_start + dysymtab.nlocalsym;
 
         for sym_index in sym_start..sym_end {
-            let nlist_offset = symtab.symoff as usize + (sym_index as usize * Nlist64::SIZE);
+            let nlist_offset =
+                symtab.symoff as usize + (sym_index as usize * self.ctx.macho.nlist_size());
 
-            let nlist_data = self.read_linkedit_data(nlist_offset as u32, Nlist64::SIZE as u32)?;
-            let (nlist, _) = Nlist64::read_from_prefix(nlist_data).map_err(|_| Error::Parse {
-                offset: nlist_offset,
-                reason: "failed to parse nlist".into(),
-            })?;
+            let nlist_data =
+                self.read_linkedit_data(nlist_offset as u32, self.ctx.macho.nlist_size() as u32)?;
+            let nlist =
+                read_nlist(nlist_data, self.ctx.macho.is_64()).map_err(|_| Error::Parse {
+                    offset: nlist_offset,
+                    reason: "failed to parse nlist".into(),
+                })?;
 
             // Read the symbol name
             let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
@@ -393,13 +391,20 @@ impl<'a> LinkeditOptimizer<'a> {
                 .insert(sym_index, self.symbol_count);
 
             // Add to our string pool and create new entry
+            self.local_keys.insert((
+                nlist.n_value,
+                nlist.n_type,
+                nlist.n_sect,
+                nlist.n_desc,
+                name.clone(),
+            ));
             let new_strx = self.string_pool.add(&name);
 
             let mut new_nlist = nlist;
             new_nlist.n_strx = new_strx;
             self.copy_alias_target(&mut new_nlist, symtab)?;
 
-            self.new_linkedit.extend_from_slice(new_nlist.as_bytes());
+            append_nlist(&mut self.new_linkedit, &new_nlist, self.ctx.macho.is_64())?;
             self.symbol_count += 1;
             self.new_local_sym_count += 1;
         }
@@ -411,175 +416,31 @@ impl<'a> LinkeditOptimizer<'a> {
     ///
     /// This is used for older caches that store local symbols in a separate table
     /// (local_symbols_offset != 0 or .symbols file exists).
-    #[allow(dead_code)]
     fn copy_local_symbols_from_cache(&mut self) -> Result<()> {
-        let Some(symbols_data) = self.ctx.cache.symbols_cache_data() else {
-            return Ok(());
-        };
-
-        let Some(local_symbols_info) = self.ctx.cache.local_symbols_info else {
-            return Ok(());
-        };
-
-        let Some(local_symbols_offset) = self.ctx.cache.local_symbols_offset() else {
-            return Ok(());
-        };
-
-        // Find the entry for this image
-        let text_seg = self.ctx.macho.text_segment().ok_or(Error::Parse {
-            offset: 0,
-            reason: "no __TEXT segment".into(),
-        })?;
-
-        let image_offset = if self.ctx.cache.uses_64bit_local_symbol_entries() {
-            // Newer cache: use VM offset from shared region start
-            text_seg.command.vmaddr - self.ctx.cache.shared_region_start
-        } else {
-            // Older cache: use file offset
-            self.ctx
-                .cache
-                .addr_to_offset(text_seg.command.vmaddr)
-                .unwrap_or(0)
-        };
-
-        // Find matching entry
-        let entries_start =
-            local_symbols_offset as usize + local_symbols_info.entries_offset as usize;
-
-        let (nlist_start_index, nlist_count) = if self.ctx.cache.uses_64bit_local_symbol_entries() {
-            self.find_local_symbols_entry_64(
-                symbols_data,
-                &local_symbols_info,
-                entries_start,
-                image_offset,
-            )?
-        } else {
-            self.find_local_symbols_entry_32(
-                symbols_data,
-                &local_symbols_info,
-                entries_start,
-                image_offset as u32,
-            )?
-        };
-
-        if nlist_count == 0 {
-            return Ok(());
+        let symbols = self
+            .ctx
+            .cache
+            .local_symbols_for_image(self.ctx.image_address)?;
+        if self.new_local_sym_count == 0 {
+            self.new_local_sym_index = self.symbol_count;
         }
-
-        self.new_local_sym_index = self.symbol_count;
-
-        // Copy the nlist entries
-        let nlist_base = local_symbols_offset as usize + local_symbols_info.nlist_offset as usize;
-        let string_base =
-            local_symbols_offset as usize + local_symbols_info.strings_offset as usize;
-
-        for i in 0..nlist_count {
-            let nlist_offset = nlist_base + ((nlist_start_index + i) as usize * Nlist64::SIZE);
-
-            if nlist_offset + Nlist64::SIZE > symbols_data.len() {
-                break;
+        for symbol in symbols {
+            let n = symbol.entry;
+            let mut name = symbol.name.to_vec();
+            name.push(0); // same canonical key as mapped local names
+            if !self
+                .local_keys
+                .insert((n.n_value, n.n_type, n.n_sect, n.n_desc, name))
+            {
+                continue;
             }
-
-            let (nlist, _) =
-                Nlist64::read_from_prefix(&symbols_data[nlist_offset..]).map_err(|_| {
-                    Error::Parse {
-                        offset: nlist_offset,
-                        reason: "failed to parse nlist".into(),
-                    }
-                })?;
-
-            // Read the symbol name from the local symbols string table
-            let name_offset = string_base + nlist.n_strx as usize;
-            let name = self.read_string_from(symbols_data, name_offset)?;
-
-            // Add to our string pool and create new entry
-            let new_strx = self.string_pool.add(&name);
-
-            let mut new_nlist = nlist;
-            new_nlist.n_strx = new_strx;
-
-            self.new_linkedit.extend_from_slice(new_nlist.as_bytes());
+            let mut entry = n;
+            entry.n_strx = self.string_pool.add(symbol.name);
+            append_nlist(&mut self.new_linkedit, &entry, self.ctx.macho.is_64())?;
             self.symbol_count += 1;
             self.new_local_sym_count += 1;
         }
-
         Ok(())
-    }
-
-    /// Finds local symbols entry (32-bit format).
-    fn find_local_symbols_entry_32(
-        &self,
-        data: &[u8],
-        info: &DyldCacheLocalSymbolsInfo,
-        entries_start: usize,
-        image_offset: u32,
-    ) -> Result<(u32, u32)> {
-        for i in 0..info.entries_count {
-            let entry_offset =
-                entries_start + (i as usize * std::mem::size_of::<DyldCacheLocalSymbolsEntry>());
-
-            if entry_offset + std::mem::size_of::<DyldCacheLocalSymbolsEntry>() > data.len() {
-                break;
-            }
-
-            let (entry, _) = DyldCacheLocalSymbolsEntry::read_from_prefix(&data[entry_offset..])
-                .map_err(|_| Error::Parse {
-                    offset: entry_offset,
-                    reason: "failed to parse local symbols entry".into(),
-                })?;
-
-            if entry.dylib_offset == image_offset {
-                return Ok((entry.nlist_start_index, entry.nlist_count));
-            }
-        }
-
-        Ok((0, 0))
-    }
-
-    /// Finds local symbols entry (64-bit format).
-    fn find_local_symbols_entry_64(
-        &self,
-        data: &[u8],
-        info: &DyldCacheLocalSymbolsInfo,
-        entries_start: usize,
-        image_offset: u64,
-    ) -> Result<(u32, u32)> {
-        for i in 0..info.entries_count {
-            let entry_offset =
-                entries_start + (i as usize * std::mem::size_of::<DyldCacheLocalSymbolsEntry64>());
-
-            if entry_offset + std::mem::size_of::<DyldCacheLocalSymbolsEntry64>() > data.len() {
-                break;
-            }
-
-            let (entry, _) = DyldCacheLocalSymbolsEntry64::read_from_prefix(&data[entry_offset..])
-                .map_err(|_| Error::Parse {
-                    offset: entry_offset,
-                    reason: "failed to parse local symbols entry 64".into(),
-                })?;
-
-            if entry.dylib_offset == image_offset {
-                return Ok((entry.nlist_start_index, entry.nlist_count));
-            }
-        }
-
-        Ok((0, 0))
-    }
-
-    /// Reads a null-terminated string from a byte slice.
-    fn read_string_from(&self, data: &[u8], offset: usize) -> Result<Vec<u8>> {
-        if offset >= data.len() {
-            return Err(Error::Parse {
-                offset,
-                reason: "string offset out of bounds".into(),
-            });
-        }
-
-        let bytes = &data[offset..];
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        let mut result = bytes[..end].to_vec();
-        result.push(0); // Null terminate
-        Ok(result)
     }
 
     /// Copies exported symbols (from dysymtab iextdefsym/nextdefsym).
@@ -602,13 +463,16 @@ impl<'a> LinkeditOptimizer<'a> {
         let sym_end = sym_start + dysymtab.nextdefsym;
 
         for sym_index in sym_start..sym_end {
-            let nlist_offset = symtab.symoff as usize + (sym_index as usize * Nlist64::SIZE);
+            let nlist_offset =
+                symtab.symoff as usize + (sym_index as usize * self.ctx.macho.nlist_size());
 
-            let nlist_data = self.read_linkedit_data(nlist_offset as u32, Nlist64::SIZE as u32)?;
-            let (nlist, _) = Nlist64::read_from_prefix(nlist_data).map_err(|_| Error::Parse {
-                offset: nlist_offset,
-                reason: "failed to parse nlist".into(),
-            })?;
+            let nlist_data =
+                self.read_linkedit_data(nlist_offset as u32, self.ctx.macho.nlist_size() as u32)?;
+            let nlist =
+                read_nlist(nlist_data, self.ctx.macho.is_64()).map_err(|_| Error::Parse {
+                    offset: nlist_offset,
+                    reason: "failed to parse nlist".into(),
+                })?;
 
             // Read the symbol name
             let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
@@ -636,7 +500,7 @@ impl<'a> LinkeditOptimizer<'a> {
             new_nlist.n_strx = new_strx;
             self.copy_alias_target(&mut new_nlist, symtab)?;
 
-            self.new_linkedit.extend_from_slice(new_nlist.as_bytes());
+            append_nlist(&mut self.new_linkedit, &new_nlist, self.ctx.macho.is_64())?;
             self.symbol_count += 1;
             self.new_extdef_sym_count += 1;
         }
@@ -664,13 +528,16 @@ impl<'a> LinkeditOptimizer<'a> {
         let sym_end = sym_start + dysymtab.nundefsym;
 
         for sym_index in sym_start..sym_end {
-            let nlist_offset = symtab.symoff as usize + (sym_index as usize * Nlist64::SIZE);
+            let nlist_offset =
+                symtab.symoff as usize + (sym_index as usize * self.ctx.macho.nlist_size());
 
-            let nlist_data = self.read_linkedit_data(nlist_offset as u32, Nlist64::SIZE as u32)?;
-            let (nlist, _) = Nlist64::read_from_prefix(nlist_data).map_err(|_| Error::Parse {
-                offset: nlist_offset,
-                reason: "failed to parse nlist".into(),
-            })?;
+            let nlist_data =
+                self.read_linkedit_data(nlist_offset as u32, self.ctx.macho.nlist_size() as u32)?;
+            let nlist =
+                read_nlist(nlist_data, self.ctx.macho.is_64()).map_err(|_| Error::Parse {
+                    offset: nlist_offset,
+                    reason: "failed to parse nlist".into(),
+                })?;
 
             // Read the symbol name
             let name_offset = symtab.stroff as usize + nlist.n_strx as usize;
@@ -698,7 +565,7 @@ impl<'a> LinkeditOptimizer<'a> {
             new_nlist.n_strx = new_strx;
             self.copy_alias_target(&mut new_nlist, symtab)?;
 
-            self.new_linkedit.extend_from_slice(new_nlist.as_bytes());
+            append_nlist(&mut self.new_linkedit, &new_nlist, self.ctx.macho.is_64())?;
             self.symbol_count += 1;
             self.new_undef_sym_count += 1;
         }
@@ -853,7 +720,7 @@ impl<'a> LinkeditOptimizer<'a> {
         if let Some(linkedit_seg) = self.ctx.macho.segment("__LINKEDIT") {
             let offset = linkedit_seg.command_offset;
             let command = linkedit_seg.command;
-            self.ctx.macho.write_struct(offset, &command)?;
+            self.ctx.macho.write_segment(offset, &command)?;
         }
 
         // Update symtab
@@ -890,6 +757,9 @@ impl<'a> LinkeditOptimizer<'a> {
         // Update dyld info
         if let Some(offset) = self.dyld_info_offset {
             let mut dyld_info = self.dyld_info.unwrap();
+            // Rebase locations have already been decoded from cache slide info.
+            dyld_info.rebase_off = 0;
+            dyld_info.rebase_size = 0;
             if dyld_info.bind_size > 0 {
                 dyld_info.bind_off = new_linkedit_offset + self.new_bind_offset;
             }
@@ -953,7 +823,7 @@ impl<'a> LinkeditOptimizer<'a> {
 
     /// Runs the optimization process.
     ///
-    /// The LINKEDIT layout must match Apple's dsc_extractor order:
+    /// Retain legacy binding/export streams, followed by the compact tables:
     /// 1. function_starts
     /// 2. data_in_code (padding to 4-byte alignment for symbol table)
     /// 3. symbol table (nlist array)
@@ -961,6 +831,10 @@ impl<'a> LinkeditOptimizer<'a> {
     /// 5. string table
     fn optimize(mut self) -> Result<Vec<u8>> {
         self.find_load_commands();
+        // Legacy caches retain dyld opcode streams. Keep their offsets backed
+        // by actual output bytes, including exports used by address lookup.
+        self.copy_binding_info()?;
+        self.copy_export_info()?;
 
         // 1. Copy function starts FIRST (Apple's order)
         self.copy_function_starts()?;
@@ -999,6 +873,7 @@ impl<'a> LinkeditOptimizer<'a> {
 
         // Copy symbols (order: local, exported, imported)
         self.copy_local_symbols()?;
+        self.copy_local_symbols_from_cache()?;
         self.copy_exported_symbols()?;
         self.copy_imported_symbols()?;
 

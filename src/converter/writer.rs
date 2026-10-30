@@ -38,116 +38,64 @@ pub fn optimize_offsets(ctx: &mut ExtractionContext) -> Result<Vec<WriteProcedur
     ctx.info("Optimizing file offsets...");
 
     let mut procedures = Vec::new();
-
-    // The header and load commands will be written at offset 0
-    // (as part of the TEXT segment's file range)
-    let header_size = ctx.macho.header.sizeofcmds as u64 + 32;
-
-    // Collect segment info first (to avoid borrow issues)
-    let segment_info: Vec<(usize, u64, u64, bool, String)> = ctx
+    let header_size = (ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize) as u64;
+    let segments: Vec<_> = ctx
         .macho
         .segments()
-        .filter(|seg| seg.command.filesize > 0)
-        .map(|seg| {
-            let is_linkedit = seg.name() == "__LINKEDIT";
-            (
-                seg.command_offset,
-                seg.command.fileoff,
-                seg.command.filesize,
-                is_linkedit,
-                seg.name().to_string(),
-            )
-        })
+        .filter(|s| s.command.filesize > 0)
+        .cloned()
         .collect();
-
-    let mut old_linkedit_off: Option<u64> = None;
-    let mut new_linkedit_off: Option<u64> = None;
-
-    // Start writing at offset 0
-    let mut write_offset: u64 = 0;
-    let mut is_first_segment = true;
-
-    // Process each segment - update file offsets and create write procedures
-    for (cmd_offset, old_fileoff, filesize, is_linkedit, _seg_name) in segment_info {
-        if is_linkedit {
+    let mut old_linkedit_off = None;
+    let mut new_linkedit_off = None;
+    let mut write_offset = 0u64;
+    for (index, segment) in segments.iter().enumerate() {
+        let old_fileoff = segment.command.fileoff;
+        let filesize = segment.command.filesize;
+        if segment.name() == "__LINKEDIT" {
             old_linkedit_off = Some(old_fileoff);
             new_linkedit_off = Some(write_offset);
         }
-
-        // For the first segment (TEXT), the header is at the start
-        if is_first_segment {
-            // Write header and load commands first (from offset 0 in macho buffer)
+        if index == 0 {
+            let remainder = filesize.checked_sub(header_size).ok_or(Error::Parse {
+                offset: segment.command_offset,
+                reason: "first segment smaller than header".into(),
+            })?;
             procedures.push(WriteProcedure::from_macho(0, 0, header_size));
-
-            // Write the rest of TEXT segment data (excluding the header portion)
-            // The segment data in macho buffer is at old_fileoff, but the first
-            // header_size bytes of the segment overlap with the header
-            let data_start = old_fileoff + header_size;
-            let data_size = filesize - header_size;
-            if data_size > 0 {
+            if remainder != 0 {
                 procedures.push(WriteProcedure::from_macho(
                     header_size,
-                    data_start,
-                    data_size,
+                    old_fileoff + header_size,
+                    remainder,
                 ));
             }
-
-            // Update the segment command's fileoff to 0
-            let fileoff_offset = cmd_offset + 40;
-            ctx.macho.write_u64(fileoff_offset, 0)?;
-
-            // Update section file offsets - they need to account for the new layout
-            let nsects_offset = cmd_offset + 64;
-            let nsects = ctx.macho.read_u32(nsects_offset)? as usize;
-
-            for i in 0..nsects {
-                let section_offset = cmd_offset + 72 + i * 80;
-                let sect_offset_field = section_offset + 48;
-                let old_sect_offset = ctx.macho.read_u32(sect_offset_field)?;
-
-                if old_sect_offset != 0 {
-                    // Section offset relative to segment start stays the same
-                    // New offset = old_offset - old_fileoff (relative offset in segment)
-                    let relative_offset = old_sect_offset as u64 - old_fileoff;
-                    ctx.macho
-                        .write_u32(sect_offset_field, relative_offset as u32)?;
-                }
-            }
-
-            write_offset = filesize;
-            is_first_segment = false;
         } else {
-            // No page alignment between segments - pack contiguously
-            // (This matches Apple's dsc_extractor behavior)
-
-            // Create write procedure
             procedures.push(WriteProcedure::from_macho(
                 write_offset,
                 old_fileoff,
                 filesize,
             ));
-
-            // Update segment and section offsets
-            let fileoff_offset = cmd_offset + 40;
-            ctx.macho.write_u64(fileoff_offset, write_offset)?;
-
-            let nsects_offset = cmd_offset + 64;
-            let nsects = ctx.macho.read_u32(nsects_offset)? as usize;
-
-            for i in 0..nsects {
-                let section_offset = cmd_offset + 72 + i * 80;
-                let sect_offset_field = section_offset + 48;
-                let old_sect_offset = ctx.macho.read_u32(sect_offset_field)?;
-
-                if old_sect_offset != 0 {
-                    let delta = old_sect_offset as u64 - old_fileoff;
-                    let new_sect_offset = (write_offset + delta) as u32;
-                    ctx.macho.write_u32(sect_offset_field, new_sect_offset)?;
-                }
-            }
-
-            write_offset += filesize;
         }
+        let mut command = segment.command;
+        command.fileoff = write_offset;
+        ctx.macho.write_segment(segment.command_offset, &command)?;
+        for section in &segment.sections {
+            let mut record = section.section;
+            if record.offset != 0 {
+                record.offset = (record.offset as u64)
+                    .checked_sub(old_fileoff)
+                    .and_then(|delta| write_offset.checked_add(delta))
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or(Error::Parse {
+                        offset: section.struct_offset,
+                        reason: "section offset overflow".into(),
+                    })?;
+            }
+            ctx.macho.write_section(section.struct_offset, &record)?;
+        }
+        write_offset = write_offset.checked_add(filesize).ok_or(Error::Parse {
+            offset: segment.command_offset,
+            reason: "output size overflow".into(),
+        })?;
     }
 
     // Add extra segment if present
@@ -179,8 +127,8 @@ fn update_linkedit_load_commands(
     let delta = new_linkedit_off as i64 - old_linkedit_off as i64;
 
     // Iterate through load commands and update offsets
-    let mut offset = 32usize; // Start after mach_header_64
-    let end_offset = 32 + ctx.macho.header.sizeofcmds as usize;
+    let mut offset = ctx.macho.header_size(); // Start after mach_header_64
+    let end_offset = ctx.macho.header_size() + ctx.macho.header.sizeofcmds as usize;
 
     while offset < end_offset {
         if offset + 8 > ctx.macho.data.len() {
@@ -480,4 +428,44 @@ fn write_macho_buffered(
 #[allow(dead_code)]
 fn align_to(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+/// Assembles write procedures in memory, checking every source and destination.
+pub(crate) fn assemble_macho(
+    ctx: &ExtractionContext,
+    procedures: &[WriteProcedure],
+) -> Result<Vec<u8>> {
+    let bad = || Error::Parse {
+        offset: 0,
+        reason: "Mach-O write extent out of bounds".into(),
+    };
+    let size = procedures.iter().try_fold(0u64, |size, p| {
+        p.write_offset
+            .checked_add(p.size)
+            .map(|end| size.max(end))
+            .ok_or_else(bad)
+    })?;
+    let size = size
+        .checked_add(4095)
+        .map(|v| v & !4095)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(bad)?;
+    let mut output = vec![0; size];
+    for p in procedures {
+        let source = match p.source {
+            WriteSource::Macho => &ctx.macho.data[..],
+            WriteSource::ExtraSegment => &ctx.extra_segment_data[..],
+            WriteSource::Cache { subcache_index } => ctx.cache.data_for_subcache(subcache_index),
+        };
+        let start = usize::try_from(p.read_offset).map_err(|_| bad())?;
+        let len = usize::try_from(p.size).map_err(|_| bad())?;
+        let end = start.checked_add(len).ok_or_else(bad)?;
+        let dest = usize::try_from(p.write_offset).map_err(|_| bad())?;
+        let dest_end = dest.checked_add(len).ok_or_else(bad)?;
+        output
+            .get_mut(dest..dest_end)
+            .ok_or_else(bad)?
+            .copy_from_slice(source.get(start..end).ok_or_else(bad)?);
+    }
+    Ok(output)
 }

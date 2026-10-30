@@ -1114,7 +1114,9 @@ fn selected_merge_rejects_overlaps_and_malformed_symbol_indexes_before_writing()
     for failure in 0..3 {
         let mut b = selected_fixture();
         match failure {
-            0 => image(&mut b, 1, BASE + 0x1000, "/usr/lib/Target"),
+            // Distinct image headers with genuinely overlapping TEXT ranges.
+            // Repeated load addresses alone are valid cache install-name aliases.
+            0 => u64at(&mut b, 0x3020 + 24, BASE + 0x1000),
             1 => u64at(&mut b, 0x8018, u64::MAX), // N_INDR alias string index
             _ => u32at(&mut b, 0x8700, 12345),    // indirect symbol index
         }
