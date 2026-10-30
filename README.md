@@ -403,14 +403,20 @@ Options:
 
 When no cache path is specified, dylex searches these locations in order:
 
-1. `/System/Volumes/Preboot/Cryptexes` (native OS and Rosetta products)
+1. `/System/Volumes/Preboot/Cryptexes` (OS, DriverKit, staged updates, and Rosetta products)
 2. `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld`
-3. `/System/Library/dyld`
-4. `/var/db/dyld`
+3. `/System/Volumes/Preboot/Cryptexes/OS/System/DriverKit/System/Library/dyld`
+4. `/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/dyld`
+5. `/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/DriverKit/System/Library/dyld`
+6. `/System/Library/dyld`
+7. `/var/db/dyld`
 
 Commands without `--arch` retain the native system-cache default. `dylex arches`
 lists each product separately. `dylex strings --all-arches` searches every
-discovered product. When `--arch x86` matches both Rosetta caches, an
+discovered product. Single-cache selection, including `--arch arm`, prefers
+matching primary caches over `Incoming` and DriverKit products. An explicit
+cache file or directory selects those products directly. When `--arch x86`
+matches both Rosetta caches, an
 exact main-file path selects the product:
 
 ```bash
@@ -418,8 +424,10 @@ dylex info /System/Volumes/Preboot/Cryptexes/Rosetta/System/Library/dyld/dyld_sh
 dylex info /System/Volumes/Preboot/Cryptexes/Rosetta/System/x86Support/System/Library/dyld/dyld_shared_cache_x86_64
 ```
 
-These Rosetta paths were observed on macOS 27 build `26A5425a`. Discovery excludes
-staged `Incoming` updates and DriverKit subtrees unless selected explicitly.
+These Rosetta paths were observed on macOS 27 build `26A5425a`. Discovery also
+includes staged `Incoming` updates and DriverKit subtrees. If multiple products
+remain after applying the preference, select the exact main cache file using
+positional `[CACHE]`.
 
 ## 32-bit ARM caches
 

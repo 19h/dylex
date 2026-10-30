@@ -22,10 +22,13 @@ use dylex::{
 
 /// Default locations to search for dyld shared caches on macOS.
 const DEFAULT_CACHE_PATHS: &[&str] = &[
-    // Discover native and both Rosetta products under their separate cryptexes.
+    // Discover OS, DriverKit, staged updates, and Rosetta products.
     "/System/Volumes/Preboot/Cryptexes",
     // macOS Ventura+ (cryptex)
     "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
+    "/System/Volumes/Preboot/Cryptexes/OS/System/DriverKit/System/Library/dyld",
+    "/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/dyld",
+    "/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/DriverKit/System/Library/dyld",
     // Traditional location
     "/System/Library/dyld",
     // Alternative location
@@ -418,11 +421,6 @@ fn discover_caches(dir: &Path) -> Result<Vec<CacheInfo>> {
             let ty = entry.file_type()?;
             // Bounded traversal; never follow directory symlinks into cycles.
             if ty.is_dir() && depth < 8 {
-                // Staged updates and DriverKit caches are separate products.
-                // They remain usable when their directory/file is explicit.
-                if matches!(entry.file_name().to_str(), Some("Incoming" | "DriverKit")) {
-                    continue;
-                }
                 pending.push((path, depth + 1));
                 continue;
             }
@@ -489,7 +487,7 @@ fn resolve_cache_path(path: &Path, arch: Option<&str>) -> Result<PathBuf> {
     }
 
     // Filter by architecture if specified
-    let matching: Vec<_> = if let Some(arch_filter) = arch {
+    let mut matching: Vec<_> = if let Some(arch_filter) = arch {
         caches
             .iter()
             .filter(|c| c.arch.contains(arch_filter))
@@ -497,6 +495,25 @@ fn resolve_cache_path(path: &Path, arch: Option<&str>) -> Result<PathBuf> {
     } else {
         caches.iter().collect()
     };
+
+    // Prefer primary products over staged updates and DriverKit when selecting
+    // one cache. Use paths relative to the search root so explicitly selected
+    // Incoming/DriverKit directories still work normally.
+    let primary: Vec<_> = matching
+        .iter()
+        .copied()
+        .filter(|cache| {
+            !cache
+                .path
+                .strip_prefix(path)
+                .unwrap()
+                .components()
+                .any(|c| c.as_os_str() == "Incoming" || c.as_os_str() == "DriverKit")
+        })
+        .collect();
+    if !primary.is_empty() {
+        matching = primary;
+    }
 
     if matching.is_empty() {
         let available: Vec<_> = caches.iter().map(|c| c.arch.as_str()).collect();
@@ -1424,16 +1441,6 @@ mod discovery_tests {
             "OS/System/Library/dyld/dyld_shared_cache_arm64e.01",
             b"dyld_v1  arm64e\0",
         );
-        cache(
-            dir.path(),
-            "Incoming/OS/System/Library/dyld/dyld_shared_cache_arm64e",
-            b"dyld_v1  arm64e\0",
-        );
-        cache(
-            dir.path(),
-            "Rosetta/System/DriverKit/System/Library/dyld/dyld_shared_cache_x86_64",
-            b"dyld_v1  x86_64\0",
-        );
         assert_eq!(discover_caches(dir.path()).unwrap().len(), 3);
         assert_eq!(
             resolve_cache_path(dir.path(), Some("arm64e")).unwrap(),
@@ -1467,6 +1474,75 @@ mod discovery_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("does not match")
+        );
+    }
+    #[test]
+    fn discovers_os_driverkit_and_incoming_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let locations = [
+            "OS/System/Library/dyld",
+            "OS/System/DriverKit/System/Library/dyld",
+            "Incoming/OS/System/Library/dyld",
+            "Incoming/OS/System/DriverKit/System/Library/dyld",
+        ];
+        let mut expected = Vec::new();
+        for location in locations {
+            assert!(
+                DEFAULT_CACHE_PATHS
+                    .contains(&format!("/System/Volumes/Preboot/Cryptexes/{location}").as_str())
+            );
+            let path = cache(
+                dir.path(),
+                &format!("{location}/dyld_shared_cache_arm64e"),
+                b"dyld_v1  arm64e\0",
+            );
+            assert_eq!(resolve_cache_path(&path, None).unwrap(), path);
+            assert_eq!(
+                resolve_cache_path(path.parent().unwrap(), Some("arm64e")).unwrap(),
+                path
+            );
+            expected.push(path);
+        }
+        expected.sort();
+        let discovered = discover_caches(dir.path()).unwrap();
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|c| c.path.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(discovered.iter().all(|c| c.arch == "arm64e"));
+        let all = resolve_search_caches(Some(dir.path().to_path_buf()), &[], true).unwrap();
+        assert_eq!(all.len(), 4);
+        let installed = dir
+            .path()
+            .join("OS/System/Library/dyld/dyld_shared_cache_arm64e");
+        for arch in [None, Some("arm"), Some("arm64e")] {
+            assert_eq!(resolve_cache_path(dir.path(), arch).unwrap(), installed);
+        }
+        let selected =
+            resolve_search_caches(Some(dir.path().to_path_buf()), &["arm".into()], false).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].path, installed);
+
+        // Explicit staged directories retain their own OS-cache preference.
+        let incoming = dir.path().join("Incoming");
+        let staged = incoming.join("OS/System/Library/dyld/dyld_shared_cache_arm64e");
+        assert_eq!(resolve_cache_path(&incoming, Some("arm")).unwrap(), staged);
+
+        // Secondary products remain selectable when no primary cache matches.
+        fs::remove_file(installed).unwrap();
+        fs::remove_file(staged).unwrap();
+        assert!(resolve_cache_path(dir.path(), Some("arm")).is_err());
+        let staged_driverkit = dir
+            .path()
+            .join("Incoming/OS/System/DriverKit/System/Library/dyld/dyld_shared_cache_arm64e");
+        fs::remove_file(staged_driverkit).unwrap();
+        assert_eq!(
+            resolve_cache_path(dir.path(), Some("arm")).unwrap(),
+            dir.path()
+                .join("OS/System/DriverKit/System/Library/dyld/dyld_shared_cache_arm64e")
         );
     }
     #[test]
