@@ -38,16 +38,9 @@ impl DyldContext {
         match candidates.as_slice() {
             [image] => Ok(image),
             [] => Err(Error::ImageNotFound { name: query.into() }),
-            _ => Err(Error::Parse {
-                offset: 0,
-                reason: format!(
-                    "ambiguous image {query:?}; use a full path:\n{}",
-                    candidates
-                        .iter()
-                        .map(|i| format!("  {}", i.path))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ),
+            _ => Err(Error::AmbiguousImage {
+                query: query.into(),
+                candidates: candidates.iter().map(|i| i.path.clone()).collect(),
             }),
         }
     }

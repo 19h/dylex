@@ -1,4 +1,4 @@
-//! dylex - A high-performance dyld shared cache extractor.
+//! dylex - A high-performance dyld shared cache and kernelcache extractor.
 //!
 //! This library provides functionality for extracting Mach-O images from
 //! Apple's dyld shared cache. The extraction process reverses the optimizations
@@ -14,6 +14,7 @@
 //! - Stub fixing
 //! - ObjC metadata restoration
 //! - Literal string search across cache images
+//! - Fileset and prelinked kernelcache extraction, including compressed inputs
 //!
 //! # Example
 //!
@@ -42,6 +43,7 @@ pub mod arm64;
 pub mod converter;
 pub mod dyld;
 pub mod error;
+pub mod kernelcache;
 pub mod macho;
 pub mod util;
 
@@ -55,6 +57,7 @@ pub use dyld::{
     StringSearchOutcome, parse_hex_bytes,
 };
 pub use error::{Error, Result};
+pub use kernelcache::{KernelCacheContext, KernelCacheFormat, KernelImage};
 pub use macho::MachOContext;
 
 use std::collections::{HashSet, VecDeque};

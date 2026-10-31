@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::macho::SegmentInfo;
 
 /// How far around a match to look for the enclosing ASCII C string.
-const CONTEXT_BYTES: u64 = 4096;
+pub(crate) const CONTEXT_BYTES: u64 = 4096;
 /// Longest C string copied into [`StringHit::text`].
 const MAX_TEXT: usize = 512;
 
@@ -29,7 +29,7 @@ pub struct StringQuery {
 /// One string match inside a cache image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringHit {
-    /// Image path inside the cache.
+    /// Image path inside the cache, or the image ID inside a kernelcache.
     pub image_path: String,
     /// Segment name, such as `__TEXT`.
     pub segment: String,
@@ -386,19 +386,34 @@ impl DyldContext {
         }
         let data = self.data_at_addr(window_start, (window_end - window_start) as usize)?;
         let rel = (match_addr - window_start) as usize;
-        if let Some((start, end)) = ascii_cstring_span(data, rel, needle_len) {
-            let mut text = String::from_utf8_lossy(&data[start..end]).into_owned();
-            truncate_text(&mut text);
-            return Ok((window_start + start as u64, text, true));
-        }
-        let snip_start = rel.saturating_sub(16);
-        let snip_end = (rel + needle_len).saturating_add(16).min(data.len());
-        Ok((
-            match_addr,
-            escape_snippet(&data[snip_start..snip_end]),
-            false,
-        ))
+        let (offset, text, is_cstring) = describe_match(data, rel, needle_len);
+        Ok((window_start + offset as u64, text, is_cstring))
     }
+}
+
+/// Describes a match at `match_rel` in `data`, which should extend
+/// [`CONTEXT_BYTES`] around it.
+///
+/// Returns `(offset, text, is_cstring)`: the enclosing ASCII C string and its
+/// offset when there is one, otherwise an escaped snippet of the surrounding
+/// bytes and the match offset.
+pub(crate) fn describe_match(
+    data: &[u8],
+    match_rel: usize,
+    needle_len: usize,
+) -> (usize, String, bool) {
+    if let Some((start, end)) = ascii_cstring_span(data, match_rel, needle_len) {
+        let mut text = String::from_utf8_lossy(&data[start..end]).into_owned();
+        truncate_text(&mut text);
+        return (start, text, true);
+    }
+    let snip_start = match_rel.saturating_sub(16);
+    let snip_end = (match_rel + needle_len).saturating_add(16).min(data.len());
+    (
+        match_rel,
+        escape_snippet(&data[snip_start..snip_end]),
+        false,
+    )
 }
 
 fn next_mapping_address(mappings: &[MappingEntry], addr: u64) -> Option<u64> {
@@ -408,7 +423,7 @@ fn next_mapping_address(mappings: &[MappingEntry], addr: u64) -> Option<u64> {
         .map(|mapping| mapping.address)
 }
 
-fn section_name_at(segment: &SegmentInfo, addr: u64) -> Option<String> {
+pub(crate) fn section_name_at(segment: &SegmentInfo, addr: u64) -> Option<String> {
     segment
         .sections
         .iter()
@@ -478,7 +493,7 @@ fn remember_tail(carry: &mut Carry, data: &[u8], addr: u64, slice_end: u64, need
     }
 }
 
-fn find_all(haystack: &[u8], needle: &[u8], ignore_case: bool) -> Vec<usize> {
+pub(crate) fn find_all(haystack: &[u8], needle: &[u8], ignore_case: bool) -> Vec<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return Vec::new();
     }

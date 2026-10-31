@@ -1,6 +1,7 @@
-//! dylex - A high-performance dyld shared cache extractor.
+//! dylex - A high-performance dyld shared cache and kernelcache extractor.
 //!
-//! Extract individual dylibs or all frameworks from Apple's dyld shared cache.
+//! Extract individual dylibs or all frameworks from Apple's dyld shared cache,
+//! and the kernel or kexts from a kernelcache.
 
 use std::collections::HashSet;
 use std::fs;
@@ -21,6 +22,8 @@ use dylex::{
     extract_images_with_dependencies,
 };
 
+mod kernelcache_cli;
+
 /// Default locations to search for dyld shared caches on macOS.
 const DEFAULT_CACHE_PATHS: &[&str] = &[
     // Discover OS, DriverKit, staged updates, and Rosetta products.
@@ -36,7 +39,7 @@ const DEFAULT_CACHE_PATHS: &[&str] = &[
     "/var/db/dyld",
 ];
 
-/// A high-performance dyld shared cache extractor.
+/// A high-performance dyld shared cache and kernelcache extractor.
 #[derive(Parser, Debug)]
 #[command(name = "dylex")]
 #[command(author, version, about, long_about = None)]
@@ -271,6 +274,13 @@ enum Commands {
         /// If not specified, searches default system locations.
         cache: Option<PathBuf>,
     },
+
+    /// Inspect, search, and extract kernelcaches (kernel collections and prelinked kernels)
+    #[command(visible_aliases = ["kc", "kernelcache"])]
+    Kernel {
+        #[command(subcommand)]
+        command: kernelcache_cli::KernelCommand,
+    },
 }
 
 /// Reject cache paths supplied where an architecture filter is expected.
@@ -382,6 +392,7 @@ fn main() -> Result<()> {
             arch,
             address,
         } => cmd_lookup(cache, arch, address),
+        Commands::Kernel { command } => kernelcache_cli::run(command),
     }
 }
 
@@ -425,7 +436,10 @@ fn find_default_cache_dir() -> Result<PathBuf> {
 /// Gets the cache path, using defaults if not specified.
 fn get_cache_path(cache: Option<PathBuf>) -> Result<PathBuf> {
     match cache {
-        Some(path) => Ok(path),
+        Some(path) => {
+            kernelcache_cli::reject_kernelcache(&path)?;
+            Ok(path)
+        }
         None => find_default_cache_dir(),
     }
 }
@@ -558,6 +572,7 @@ fn collect_caches(path: Option<PathBuf>, scan: &DiskScan) -> Result<Vec<CacheInf
     };
     for root in roots {
         if root.is_file() {
+            kernelcache_cli::reject_kernelcache(&root)?;
             caches.push(CacheInfo {
                 arch: architecture_of(&root)?,
                 path: root,
@@ -1887,9 +1902,10 @@ mod selection_cli_tests {
                 | Commands::List { arch, cache, .. }
                 | Commands::Info { arch, cache }
                 | Commands::Lookup { arch, cache, .. } => (arch, cache),
-                Commands::Strings { .. } | Commands::Arches { .. } | Commands::Find { .. } => {
-                    unreachable!()
-                }
+                Commands::Strings { .. }
+                | Commands::Arches { .. }
+                | Commands::Find { .. }
+                | Commands::Kernel { .. } => unreachable!(),
             };
             assert_eq!(arch.as_deref(), Some("x86_64"));
             assert_eq!(cache, Some(PathBuf::from(path)));

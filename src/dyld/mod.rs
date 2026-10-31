@@ -37,3 +37,4 @@ pub use symbols::*;
 pub use trie::*;
 
 pub(crate) use objc::decode_slide_pointer;
+pub(crate) use strings::{CONTEXT_BYTES, describe_match, find_all, section_name_at};

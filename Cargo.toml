@@ -1,9 +1,9 @@
 [package]
 name = "dylex"
-version = "2.4.0"
+version = "3.0.0"
 edition = "2024"
 authors = ["dylex contributors"]
-description = "A high-performance dyld shared cache extractor for macOS and iOS"
+description = "A high-performance dyld shared cache and kernelcache extractor for macOS and iOS"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/19h/dylex"
@@ -29,6 +29,11 @@ maintenance = { status = "actively-developed" }
 # Binary parsing
 zerocopy = { version = "0.8", features = ["derive"] }
 scroll = { version = "0.12", features = ["derive"] }
+
+# Kernelcache prelink metadata and compression (plist pin preserves Rust 1.85).
+plist = "=1.7.0"
+quick-xml = "0.32"
+lzfse = "0.2"
 
 # Memory mapping
 memmap2 = "0.9"

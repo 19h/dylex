@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
 
-A high-performance dyld shared cache extractor for macOS and iOS, written in Rust.
+A high-performance dyld shared cache and kernelcache extractor for macOS and iOS, written in Rust.
 
 dylex extracts Mach-O files for static analysis from Apple's dyld shared cache, with symbol table reconstruction, pointer decoding, and LINKEDIT rebuilding. Extraction does not reconstruct a runnable OS loader environment.
 
@@ -22,8 +22,45 @@ dylex extracts Mach-O files for static analysis from Apple's dyld shared cache, 
 - **Directory Structure Preservation** - Optionally preserves full framework paths
 - **Batch Extraction** - Extract multiple images with filters and parallel processing
 - **String Search** - Find a literal string or hex byte sequence in cache images, with an optional image filter, in one architecture or every discovered cache. `extract --search` writes every image that contains the match
+- **Kernelcaches** - List, search, locate, and extract fileset kernel collections and legacy prelinked kexts, including IMG4/IM4P, LZFSE, and complzss inputs
 
 See [cache compatibility and validation](docs/cache-compatibility.md) for the tested macOS 27 build, older-format fixtures, source provenance, assumptions, and mode limitations.
+
+## Kernelcaches
+
+Kernelcaches have their own command group, `dylex kernel` (alias `kc`), which
+mirrors the dyld commands. Each command takes an optional kernelcache path; on
+macOS, omitting it uses the running system's boot kernelcache, verified against
+the running kernel's UUID.
+
+```bash
+# The running system's boot kernelcache
+dylex kernel info
+dylex kernel list -A -f sandbox
+dylex kernel extract -i com.apple.security.sandbox -o sandbox.macho
+dylex kernel extract --all -o ./kernelcache-images
+dylex kernel strings -f sandbox Seatbelt
+dylex kernel lookup 0xfffffe0007d342aa
+
+# Any kernelcache file: raw Mach-O, IMG4/IM4P, LZFSE, or complzss
+cache=/path/to/kernelcache.release.mac16j
+dylex kernel extract -i com.apple.kernel -o kernel.macho "$cache"
+dylex kernel extract --search Seatbelt -o ./matching-images "$cache"
+```
+
+`dylex kernel locate` shows which boot kernelcaches match the running kernel,
+and with `--target BUNDLE_ID` also the loaded version of that kext. It reports
+the collection, kernel, and target UUIDs separately, keeps rejected candidates
+and their reasons, and searches bounded fallback locations only when the
+KernelManagement selection does not verify. `--paths-only` prints just the
+verified paths for scripts.
+
+Extraction preserves unslid code addresses, decodes supported chained pointers,
+and builds private symbol/string tables for each image. Outputs are for static
+analysis. Nonzero kernel-collection cache levels, unresolved chained binds,
+legacy section-based pointer chains, encrypted payloads, and universal/fat files
+are unsupported. Merge and dependency modes apply to dyld caches only. See
+[kernelcache formats, library API, assumptions, and validation](docs/kernelcache.md).
 
 ## Installation
 

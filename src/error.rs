@@ -142,6 +142,16 @@ pub enum Error {
     #[error("image not found: {name}")]
     ImageNotFound { name: String },
 
+    #[error(
+        "ambiguous image {query:?} matches {} images; use one of:\n{}",
+        .candidates.len(),
+        list_candidates(.candidates)
+    )]
+    AmbiguousImage {
+        query: String,
+        candidates: Vec<String>,
+    },
+
     #[error("image at index {index} out of bounds (total: {total})")]
     ImageIndexOutOfBounds { index: usize, total: usize },
 
@@ -195,4 +205,19 @@ impl Error {
     pub fn buffer_too_small(needed: usize, available: usize) -> Self {
         Error::BufferTooSmall { needed, available }
     }
+}
+
+/// Formats ambiguous-image candidates one per line, eliding all but the first few.
+fn list_candidates(candidates: &[String]) -> String {
+    const MAX_LISTED: usize = 20;
+
+    let mut lines: Vec<_> = candidates
+        .iter()
+        .take(MAX_LISTED)
+        .map(|candidate| format!("  {candidate}"))
+        .collect();
+    if candidates.len() > MAX_LISTED {
+        lines.push(format!("  ... and {} more", candidates.len() - MAX_LISTED));
+    }
+    lines.join("\n")
 }
